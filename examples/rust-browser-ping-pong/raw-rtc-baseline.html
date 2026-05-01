@@ -1,0 +1,461 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Raw RTCDataChannel Baseline</title>
+    <style>
+      body {
+        font-family: system-ui, sans-serif;
+        margin: 2rem;
+      }
+
+      label {
+        display: block;
+        margin: 0.75rem 0;
+      }
+
+      input {
+        width: 42rem;
+        max-width: 100%;
+      }
+
+      pre {
+        border: 1px solid #ccc;
+        padding: 1rem;
+        white-space: pre-wrap;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>Raw RTCDataChannel Baseline</h1>
+    <label>Local id <input id="local" readonly /></label>
+    <label>Remote id <input id="remote" /></label>
+    <button id="connect">Connect</button>
+    <label>Latency samples <input id="samples" type="number" min="3" max="200" value="25" /></label>
+    <button id="latency" disabled>Latency</button>
+    <label>Throughput MiB <input id="throughput-mib" type="number" min="1" max="64" value="8" /></label>
+    <button id="throughput" disabled>Throughput</button>
+    <button id="loopback">In-page Pair Latency</button>
+    <pre id="log"></pre>
+
+    <script type="module">
+      const local = document.querySelector("#local");
+      const remote = document.querySelector("#remote");
+      const connect = document.querySelector("#connect");
+      const latency = document.querySelector("#latency");
+      const throughput = document.querySelector("#throughput");
+      const throughputMib = document.querySelector("#throughput-mib");
+      const loopback = document.querySelector("#loopback");
+      const samples = document.querySelector("#samples");
+      const log = document.querySelector("#log");
+      const localId = crypto.getRandomValues(new Uint8Array(16))
+        .reduce((out, byte) => out + byte.toString(16).padStart(2, "0"), "");
+      const bus = new BroadcastChannel("raw-rtc-baseline");
+
+      let pc;
+      let channel;
+      let remoteId;
+      let pending = new Map();
+      let pendingThroughput = new Map();
+      let inboundUpload = null;
+
+      local.value = localId;
+      logLine(`local id: ${localId}`);
+      logLine("signaling: BroadcastChannel");
+
+      bus.onmessage = async (event) => {
+        const message = event.data;
+        if (!message || message.to !== localId || message.from === localId) {
+          return;
+        }
+        if (message.type === "offer") {
+          remoteId = message.from;
+          remote.value = remoteId;
+          pc = createPeerConnection(remoteId);
+          pc.ondatachannel = (event) => attachChannel(event.channel);
+          await pc.setRemoteDescription(message.description);
+          const answer = await pc.createAnswer();
+          await pc.setLocalDescription(answer);
+          signal(remoteId, { type: "answer", description: pc.localDescription });
+          logLine("connection: answered offer");
+          return;
+        }
+        if (message.type === "answer") {
+          await pc.setRemoteDescription(message.description);
+          logLine("connection: accepted answer");
+          return;
+        }
+        if (message.type === "ice" && message.candidate) {
+          await pc.addIceCandidate(message.candidate);
+        }
+      };
+
+      connect.addEventListener("click", async () => {
+        remoteId = remote.value.trim();
+        if (!remoteId) {
+          logLine("error: remote id is required");
+          return;
+        }
+        connect.disabled = true;
+        pc = createPeerConnection(remoteId);
+        attachChannel(pc.createDataChannel("raw-ping"));
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        signal(remoteId, { type: "offer", description: pc.localDescription });
+        logLine("connection: sent offer");
+      });
+
+      latency.addEventListener("click", async () => {
+        latency.disabled = true;
+        try {
+          await runLatency("raw latency");
+        } catch (error) {
+          logLine(`latency error: ${error?.message ?? error}`);
+        } finally {
+          latency.disabled = false;
+        }
+      });
+
+      throughput.addEventListener("click", async () => {
+        throughput.disabled = true;
+        try {
+          await runThroughput();
+        } catch (error) {
+          logLine(`throughput error: ${error?.message ?? error}`);
+        } finally {
+          throughput.disabled = !channel || channel.readyState !== "open";
+        }
+      });
+
+      loopback.addEventListener("click", async () => {
+        loopback.disabled = true;
+        latency.disabled = true;
+        throughput.disabled = true;
+        try {
+          await connectInPagePair();
+          await runLatency("raw in-page latency");
+        } catch (error) {
+          logLine(`in-page latency error: ${error?.message ?? error}`);
+        } finally {
+          loopback.disabled = false;
+          latency.disabled = !channel || channel.readyState !== "open";
+          throughput.disabled = !channel || channel.readyState !== "open";
+        }
+      });
+
+      async function runLatency(label) {
+        const count = clamp(parseInt(samples.value, 10) || 25, 3, 200);
+        const warmups = 3;
+        for (let i = 0; i < warmups; i += 1) {
+          await ping(`warmup-${i}`);
+        }
+        const values = [];
+        for (let i = 0; i < count; i += 1) {
+          values.push(await ping(String(i)));
+        }
+        values.sort((a, b) => a - b);
+        const sum = values.reduce((acc, value) => acc + value, 0);
+        const avg = sum / values.length;
+        const p50 = percentile(values, 0.5);
+        const p95 = percentile(values, 0.95);
+        logLine(
+          `${label}: n=${values.length} avg=${formatMs(avg)} p50=${formatMs(p50)} p95=${formatMs(p95)} min=${formatMs(values[0])} max=${formatMs(values[values.length - 1])}`,
+        );
+      }
+
+      async function runThroughput() {
+        if (!channel || channel.readyState !== "open") {
+          throw new Error("data channel is not open");
+        }
+        const bytes = clamp(parseInt(throughputMib.value, 10) || 8, 1, 64) * 1024 * 1024;
+        logLine(`raw throughput check: ${formatMib(bytes)}`);
+        const upload = await uploadBytes(bytes);
+        const download = await downloadBytes(bytes);
+        logLine(
+          `raw throughput: upload ${formatMib(bytes)} in ${formatMs(upload.elapsedMs)} (${formatMibPerSec(bytes, upload.elapsedMs)}/s), download ${formatMib(download.receivedBytes)} in ${formatMs(download.elapsedMs)} (${formatMibPerSec(download.receivedBytes, download.elapsedMs)}/s)`,
+        );
+      }
+
+      async function uploadBytes(bytes) {
+        const id = crypto.randomUUID();
+        const done = new Promise((resolve, reject) => {
+          pendingThroughput.set(`upload:${id}`, { resolve, reject });
+          setTimeout(() => {
+            const pending = pendingThroughput.get(`upload:${id}`);
+            if (pending) {
+              pendingThroughput.delete(`upload:${id}`);
+              pending.reject(new Error(`timed out waiting for upload ack ${id}`));
+            }
+          }, 30_000);
+        });
+        const start = performance.now();
+        channel.send(`throughput-upload:${id}:${bytes}`);
+        await sendBinaryBytes(channel, bytes);
+        const result = await done;
+        return { ...result, elapsedMs: performance.now() - start };
+      }
+
+      async function downloadBytes(bytes) {
+        const id = crypto.randomUUID();
+        const done = new Promise((resolve, reject) => {
+          pendingThroughput.set(`download:${id}`, { resolve, reject });
+          pendingThroughput.set("active-download", { id, receivedBytes: 0 });
+          setTimeout(() => {
+            const pending = pendingThroughput.get(`download:${id}`);
+            if (pending) {
+              pendingThroughput.delete(`download:${id}`);
+              pendingThroughput.delete("active-download");
+              pending.reject(new Error(`timed out waiting for download ${id}`));
+            }
+          }, 30_000);
+        });
+        const start = performance.now();
+        channel.send(`throughput-download:${id}:${bytes}`);
+        const result = await done;
+        return { ...result, elapsedMs: performance.now() - start };
+      }
+
+      async function sendBinaryBytes(targetChannel, bytes) {
+        const chunkSize = 16 * 1024;
+        const chunk = new Uint8Array(chunkSize);
+        let sent = 0;
+        while (sent < bytes) {
+          await waitForBufferedAmount(targetChannel);
+          const size = Math.min(chunkSize, bytes - sent);
+          targetChannel.send(size === chunk.length ? chunk : chunk.subarray(0, size));
+          sent += size;
+        }
+      }
+
+      async function waitForBufferedAmount(targetChannel) {
+        const maxBufferedAmount = 256 * 1024;
+        const lowThreshold = 64 * 1024;
+        targetChannel.bufferedAmountLowThreshold = lowThreshold;
+        while (targetChannel.bufferedAmount > maxBufferedAmount) {
+          await new Promise((resolve) => {
+            const timeout = setTimeout(resolve, 50);
+            targetChannel.addEventListener(
+              "bufferedamountlow",
+              () => {
+                clearTimeout(timeout);
+                resolve();
+              },
+              { once: true },
+            );
+          });
+        }
+      }
+
+      async function connectInPagePair() {
+        const left = new RTCPeerConnection({ iceServers: [] });
+        const right = new RTCPeerConnection({ iceServers: [] });
+        left.onicecandidate = (event) => {
+          if (event.candidate) {
+            right.addIceCandidate(event.candidate);
+          }
+        };
+        right.onicecandidate = (event) => {
+          if (event.candidate) {
+            left.addIceCandidate(event.candidate);
+          }
+        };
+        right.ondatachannel = (event) => attachResponder(event.channel);
+        channel = left.createDataChannel("raw-ping");
+        attachChannel(channel);
+        await left.setLocalDescription(await left.createOffer());
+        await right.setRemoteDescription(left.localDescription);
+        await right.setLocalDescription(await right.createAnswer());
+        await left.setRemoteDescription(right.localDescription);
+        await waitForOpen(channel);
+        logLine("in-page pair: open");
+      }
+
+      function createPeerConnection(destination) {
+        const peer = new RTCPeerConnection({ iceServers: [] });
+        peer.onicecandidate = (event) => {
+          if (event.candidate) {
+            signal(destination, { type: "ice", candidate: event.candidate });
+          }
+        };
+        peer.onconnectionstatechange = () => {
+          logLine(`connection state: ${peer.connectionState}`);
+        };
+        peer.oniceconnectionstatechange = () => {
+          logLine(`ice connection state: ${peer.iceConnectionState}`);
+        };
+        return peer;
+      }
+
+      function attachChannel(nextChannel) {
+        channel = nextChannel;
+        channel.binaryType = "arraybuffer";
+        channel.onopen = () => {
+          logLine("data channel: open");
+          latency.disabled = false;
+          throughput.disabled = false;
+        };
+        channel.onclose = () => {
+          logLine("data channel: close");
+          latency.disabled = true;
+          throughput.disabled = true;
+        };
+        channel.onerror = (event) => {
+          logLine(`data channel: error ${event?.error?.message ?? ""}`.trim());
+        };
+        channel.onmessage = (event) => {
+          handleChannelMessage(channel, event);
+        };
+      }
+
+      function attachResponder(nextChannel) {
+        nextChannel.binaryType = "arraybuffer";
+        nextChannel.onclose = () => logLine("responder data channel: close");
+        nextChannel.onerror = (event) => {
+          logLine(`responder data channel: error ${event?.error?.message ?? ""}`.trim());
+        };
+        nextChannel.onmessage = (event) => {
+          handleChannelMessage(nextChannel, event);
+        };
+      }
+
+      function handleChannelMessage(targetChannel, event) {
+        if (event.data instanceof ArrayBuffer) {
+          if (inboundUpload) {
+            inboundUpload.received += event.data.byteLength;
+            if (inboundUpload.received >= inboundUpload.expectedBytes) {
+              const { id, received } = inboundUpload;
+              inboundUpload = null;
+              targetChannel.send(`throughput-upload-ok:${id}:${received}`);
+            }
+          }
+          const download = pendingThroughput.get("active-download");
+          if (download) {
+            download.receivedBytes += event.data.byteLength;
+          }
+          return;
+        }
+
+        const text = String(event.data);
+        if (text.startsWith("ping:")) {
+          targetChannel.send(`pong:${text.slice("ping:".length)}`);
+          return;
+        }
+        if (text.startsWith("pong:")) {
+          const [, id] = text.split(":");
+          const resolver = pending.get(id);
+          if (resolver) {
+            pending.delete(id);
+            resolver(performance.now());
+          }
+          return;
+        }
+        if (text.startsWith("throughput-upload:")) {
+          const [, id, bytesText] = text.split(":");
+          inboundUpload = { id, expectedBytes: parseInt(bytesText, 10), received: 0 };
+          return;
+        }
+        if (text.startsWith("throughput-upload-ok:")) {
+          const [, id, receivedText] = text.split(":");
+          const pending = pendingThroughput.get(`upload:${id}`);
+          if (pending) {
+            pendingThroughput.delete(`upload:${id}`);
+            pending.resolve({ receivedBytes: parseInt(receivedText, 10) });
+          }
+          return;
+        }
+        if (text.startsWith("throughput-download:")) {
+          const [, id, bytesText] = text.split(":");
+          sendBinaryBytes(targetChannel, parseInt(bytesText, 10))
+            .then(() => targetChannel.send(`throughput-download-done:${id}`))
+            .catch((error) => targetChannel.send(`throughput-download-error:${id}:${error?.message ?? error}`));
+          return;
+        }
+        if (text.startsWith("throughput-download-done:")) {
+          const [, id] = text.split(":");
+          const download = pendingThroughput.get("active-download");
+          pendingThroughput.delete("active-download");
+          const pending = pendingThroughput.get(`download:${id}`);
+          if (pending) {
+            pendingThroughput.delete(`download:${id}`);
+            pending.resolve({ receivedBytes: download?.receivedBytes ?? 0 });
+          }
+          return;
+        }
+        if (text.startsWith("throughput-download-error:")) {
+          const [, id, message] = text.split(":");
+          pendingThroughput.delete("active-download");
+          const pending = pendingThroughput.get(`download:${id}`);
+          if (pending) {
+            pendingThroughput.delete(`download:${id}`);
+            pending.reject(new Error(message || `download ${id} failed`));
+          }
+        }
+      }
+
+      async function ping(id) {
+        if (!channel || channel.readyState !== "open") {
+          throw new Error("data channel is not open");
+        }
+        const start = performance.now();
+        const end = new Promise((resolve, reject) => {
+          pending.set(id, resolve);
+          setTimeout(() => {
+            if (pending.delete(id)) {
+              reject(new Error(`timed out waiting for ${id}`));
+            }
+          }, 5_000);
+        });
+        channel.send(`ping:${id}`);
+        return (await end) - start;
+      }
+
+      async function waitForOpen(nextChannel) {
+        if (nextChannel.readyState === "open") {
+          return;
+        }
+        await new Promise((resolve, reject) => {
+          nextChannel.addEventListener("open", resolve, { once: true });
+          setTimeout(() => reject(new Error("timed out waiting for data channel open")), 5_000);
+        });
+      }
+
+      function signal(to, payload) {
+        bus.postMessage({
+          ...payload,
+          description: payload.description?.toJSON ? payload.description.toJSON() : payload.description,
+          candidate: payload.candidate?.toJSON ? payload.candidate.toJSON() : payload.candidate,
+          from: localId,
+          to,
+        });
+      }
+
+      function percentile(sorted, p) {
+        const index = Math.min(sorted.length - 1, Math.ceil(sorted.length * p) - 1);
+        return sorted[index];
+      }
+
+      function clamp(value, min, max) {
+        return Math.min(max, Math.max(min, value));
+      }
+
+      function formatMs(value) {
+        return `${value.toFixed(2)} ms`;
+      }
+
+      function formatMib(bytes) {
+        return `${(bytes / (1024 * 1024)).toFixed(2)} MiB`;
+      }
+
+      function formatMibPerSec(bytes, elapsedMs) {
+        if (elapsedMs <= 0) {
+          return "0.00 MiB";
+        }
+        return `${(bytes / (1024 * 1024) / (elapsedMs / 1000)).toFixed(2)} MiB`;
+      }
+
+      function logLine(line) {
+        log.textContent += `${line}\n`;
+      }
+    </script>
+  </body>
+</html>

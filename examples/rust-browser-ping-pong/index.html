@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Iroh WebRTC Rust Browser Ping Pong</title>
+    <link data-trunk rel="copy-file" href="raw-rtc-baseline.html" />
+    <script>
+      globalThis.addEventListener("TrunkApplicationStarted", () => {
+        const appModule = Array.from(
+          document.querySelectorAll('link[rel="modulepreload"][href$=".js"]'),
+        ).find((link) => !new URL(link.href, document.baseURI).pathname.includes("/snippets/"));
+        if (!appModule) {
+          throw new Error("missing Trunk app module asset");
+        }
+
+        globalThis.createIrohWebRtcWorker =
+          globalThis.wasmBindings.createIrohWebRtcWorkerFactoryForModule(
+            new URL(appModule.href, document.baseURI).href,
+            globalThis.wasmBindings.__iroh_webrtc_wasm_module(),
+            "start_iroh_webrtc_worker",
+          );
+
+        globalThis.wasmBindings.start_app().catch((error) => {
+          console.error("failed to start Iroh WebRTC ping-pong app", error);
+        });
+      });
+    </script>
+  </head>
+  <body>
+    <main>
+      <h1>Iroh WebRTC Rust Browser Ping Pong</h1>
+      <label>
+        Local endpoint
+        <input id="local" autocomplete="off" spellcheck="false" readonly />
+      </label>
+      <div id="local-qr" aria-label="Local endpoint QR code"></div>
+      <label>
+        Remote endpoint
+        <input id="remote" autocomplete="off" spellcheck="false" />
+      </label>
+      <button id="ping">Ping</button>
+      <label>
+        Latency samples
+        <input id="latency-samples" type="number" min="3" max="200" value="25" />
+      </label>
+      <button id="latency">Latency</button>
+      <label>
+        Throughput MiB
+        <input id="throughput-mib" type="number" min="1" max="64" value="8" />
+      </label>
+      <button id="throughput">Throughput</button>
+      <pre id="log"></pre>
+    </main>
+  </body>
+</html>

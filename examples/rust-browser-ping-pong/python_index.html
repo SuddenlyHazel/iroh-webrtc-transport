@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Iroh WebRTC Plain Python Smoke</title>
+  </head>
+  <body>
+    <main>
+      <h1>Iroh WebRTC Plain Python Smoke</h1>
+      <label>
+        Remote endpoint
+        <input id="remote" autocomplete="off" spellcheck="false" />
+      </label>
+      <button id="ping">Ping</button>
+      <pre id="log"></pre>
+    </main>
+    <script type="module">
+      import init, * as bindings from "./__APP_JS__";
+
+      await init({ module_or_path: "./__APP_WASM__" });
+
+      globalThis.createIrohWebRtcWorker = bindings.createIrohWebRtcWorkerFactoryForModule(
+        new URL("./__APP_JS__", import.meta.url).href,
+        bindings.__iroh_webrtc_wasm_module(),
+        "start_iroh_webrtc_worker",
+      );
+
+      await bindings.start_app();
+    </script>
+  </body>
+</html>
