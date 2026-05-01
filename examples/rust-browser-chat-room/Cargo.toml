@@ -1,0 +1,29 @@
+[package]
+name = "iroh-webrtc-rust-browser-chat-room"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+console_error_panic_hook = "0.1"
+iroh-webrtc-transport = { path = "../../crates/iroh-webrtc-transport", default-features = false, features = ["browser"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+wasm-bindgen = "=0.2.118"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = [
+  "Document",
+  "Element",
+  "Event",
+  "HtmlButtonElement",
+  "HtmlElement",
+  "HtmlInputElement",
+  "HtmlTextAreaElement",
+  "KeyboardEvent",
+  "Location",
+  "Node",
+  "Window",
+] }
