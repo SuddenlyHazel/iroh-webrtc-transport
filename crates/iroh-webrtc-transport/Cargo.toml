@@ -1,10 +1,14 @@
 [package]
 name = "iroh-webrtc-transport"
-version = "0.1.0"
+version = "0.1.0-alpha.1"
 edition = "2024"
 description = "WebRTC-backed custom transport primitives for Iroh"
 readme = "README.md"
-publish = false
+publish = true
+license = "MIT"
+repository = "https://github.com/SuddenlyHazel/iroh-webrtc-transport"
+homepage = "https://github.com/SuddenlyHazel/iroh-webrtc-transport"
+documentation = "https://docs.rs/iroh-webrtc-transport"
 
 [lib]
 crate-type = ["cdylib", "rlib"]

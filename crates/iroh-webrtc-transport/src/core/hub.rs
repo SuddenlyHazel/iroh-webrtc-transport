@@ -1,3 +1,5 @@
+//! Packet routing and per-session queues for the WebRTC custom transport.
+
 use std::{
     collections::{HashMap, VecDeque},
     future::poll_fn,
@@ -36,16 +38,23 @@ pub struct OutboundPacket {
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
+/// Serializable WebRTC ICE candidate exchanged by the signaling layer.
 pub struct WebRtcIceCandidate {
+    /// Browser/native SDP candidate string.
     pub candidate: String,
+    /// Optional SDP media id for the candidate.
     pub sdp_mid: Option<String>,
+    /// Optional SDP media line index for the candidate.
     pub sdp_mline_index: Option<u16>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
+/// Local ICE event emitted by a native or browser WebRTC peer connection.
 pub enum LocalIceEvent {
+    /// A gathered ICE candidate.
     Candidate(WebRtcIceCandidate),
+    /// Candidate gathering completed.
     EndOfCandidates,
 }
 
@@ -58,6 +67,7 @@ struct LocalIceState {
 }
 
 #[derive(Debug, Clone)]
+/// Bounded queue of locally gathered ICE events.
 pub struct LocalIceQueue {
     state: Arc<Mutex<LocalIceState>>,
 }
@@ -377,6 +387,7 @@ impl Default for LocalIceQueue {
 }
 
 impl LocalIceQueue {
+    /// Create an ICE event queue with an explicit capacity.
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
             state: Arc::new(Mutex::new(LocalIceState {
@@ -386,6 +397,7 @@ impl LocalIceQueue {
         }
     }
 
+    /// Push one local ICE event into the queue.
     pub fn push(&self, event: LocalIceEvent) -> Result<()> {
         let mut state = self.state.lock().expect("local ICE mutex poisoned");
         if state.closed {
@@ -412,6 +424,7 @@ impl LocalIceQueue {
         Ok(())
     }
 
+    /// Poll for the next local ICE event.
     pub fn poll_next(&self, cx: &mut std::task::Context<'_>) -> Poll<Result<LocalIceEvent>> {
         let mut state = self.state.lock().expect("local ICE mutex poisoned");
         if let Some(event) = state.queue.pop_front() {
@@ -424,10 +437,12 @@ impl LocalIceQueue {
         Poll::Pending
     }
 
+    /// Wait for the next local ICE event.
     pub async fn next(&self) -> Result<LocalIceEvent> {
         poll_fn(|cx| self.poll_next(cx)).await
     }
 
+    /// Close the ICE event queue and wake any waiter.
     pub fn close(&self) {
         let mut state = self.state.lock().expect("local ICE mutex poisoned");
         state.closed = true;

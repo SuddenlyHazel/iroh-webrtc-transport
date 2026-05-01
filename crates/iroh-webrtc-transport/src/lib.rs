@@ -38,7 +38,7 @@
 //!
 //! # Browser shape
 //!
-//! Browser applications should use [`browser::BrowserWebRtcNode`]. The facade
+//! Browser applications should use the browser `BrowserWebRtcNode` facade. The facade
 //! keeps Iroh/Wasm access serialized in a worker while the crate's internal
 //! main-thread bridge owns `RTCPeerConnection`, SDP, ICE, and
 //! `RTCDataChannel` creation. A dedicated `MessagePort` carries RTC control
@@ -78,6 +78,7 @@ pub mod browser_protocol;
 mod browser_worker;
 pub mod config;
 mod core;
+/// Error and result types used by the transport, facades, and session helpers.
 pub mod error;
 pub mod facade;
 #[cfg(all(
@@ -85,6 +86,7 @@ pub mod facade;
     not(all(target_family = "wasm", target_os = "unknown"))
 ))]
 pub mod native;
+/// Iroh custom transport integration for WebRTC-backed packet I/O.
 pub mod transport;
 pub use error::{Error, Result};
 #[cfg(all(

@@ -1,3 +1,5 @@
+//! Shared facade configuration for browser and native node helpers.
+
 use crate::{
     config::WebRtcSessionConfig, error::Result, facade::WebRtcDialOptions,
     transport::WebRtcTransportConfig,
@@ -15,6 +17,7 @@ pub struct WebRtcNodeConfig {
 }
 
 impl WebRtcNodeConfig {
+    /// Validate the node, session, and transport configuration.
     pub fn validate(&self) -> Result<()> {
         self.session.validate()?;
         self.transport.queues.validate()?;

@@ -1,8 +1,11 @@
+//! Signaling message types used to bootstrap WebRTC sessions over Iroh streams.
+
 use std::collections::HashMap;
 
 use iroh::EndpointId;
 use serde::{Deserialize, Serialize};
 
+/// RTCDataChannel label used for Iroh/noq packet frames.
 pub const WEBRTC_DATA_CHANNEL_LABEL: &str = "iroh-noq";
 const DIAL_ID_DERIVATION_DOMAIN: &[u8] = b"iroh-webrtc-dial-id-v1";
 

@@ -1,63 +1,143 @@
 # iroh-webrtc-transport
 
-Reusable WebRTC-backed custom transport primitives for Iroh.
+WebRTC-backed custom transport primitives and facades for Iroh.
+
+This crate is experimental and currently `publish = false`. It provides the
+Rust pieces used to bootstrap a WebRTC `RTCDataChannel`, attach that channel to
+Iroh's custom transport interface, and expose normal Iroh-style connections and
+streams to application code.
 
 ## Which API Should I Use?
 
-Use the grouped modules as your public entry points:
+For application code, start with the facades:
 
 | Goal | Start here |
 | --- | --- |
-| Add the transport to an Iroh endpoint | `iroh_webrtc_transport::transport` |
-| Tune STUN, queues, frames, or backpressure | `iroh_webrtc_transport::config` |
-| Build native/server WebRTC support | `iroh_webrtc_transport::native` |
-| Build browser wasm WebRTC support | `iroh_webrtc_transport::browser` |
+| Browser Wasm app | `iroh_webrtc_transport::browser::BrowserWebRtcNode` |
+| Native/server app | `iroh_webrtc_transport::NativeWebRtcIrohNode` |
+| Shared dial options | `iroh_webrtc_transport::WebRtcDialOptions` |
+| Session, STUN, frame, queue, and DataChannel tuning | `iroh_webrtc_transport::config` |
 
-For native/server code, the basic shape is:
+For lower-level integration, `transport::{WebRtcTransport, configure_endpoint}`
+and `native::NativeWebRtcSession` remain available. Those APIs are for callers
+that want to wire their own bootstrap/signaling flow.
+
+## Basic Native Shape
+
+With the `native` feature enabled, the facade owns an Iroh bootstrap endpoint,
+a WebRTC custom-transport application endpoint, and the native WebRTC session
+lifecycle:
 
 ```rust
+use iroh::SecretKey;
 use iroh_webrtc_transport::{
-    config::WebRtcTransportConfig,
-    transport::{WebRtcTransport, configure_endpoint},
+    NativeWebRtcIrohNode, WebRtcDialOptions, WebRtcNodeConfig,
 };
 
-let transport = WebRtcTransport::new(WebRtcTransportConfig::default());
-let hub = transport.session_hub();
-let builder = configure_endpoint(builder, transport);
+# async fn example(remote: iroh::EndpointAddr) -> anyhow::Result<()> {
+let node = NativeWebRtcIrohNode::spawn(
+    WebRtcNodeConfig::default(),
+    SecretKey::generate(),
+)
+.await?;
+
+let connection = node
+    .dial(remote, b"example/alpn/1", WebRtcDialOptions::webrtc_only())
+    .await?;
+# let _ = connection;
+# Ok(())
+# }
 ```
 
-With the `native` feature enabled, use `native::NativeWebRtcSession` to create
-or answer the native WebRTC PeerConnection, exchange offer/answer/ICE over a
-bootstrap stream, and attach the opened DataChannel to the same `SessionHub`.
+`NativeWebRtcIrohNode::accept(alpn)` returns ordinary Iroh `Connection` values
+for inbound application protocols.
 
-For browser code, use `browser::BrowserWebRtcNode`. The facade starts the
-worker, exposes the local endpoint ID, and routes dial/accept/stream/benchmark
-commands. The crate keeps `RTCPeerConnection`, SDP/ICE, and
-`RTCDataChannel` creation on the browser main thread, while worker Wasm owns
-Iroh endpoint/session state and attaches transferred data channels before
-packet I/O starts.
+## Basic Browser Shape
+
+Browser applications should use `browser::BrowserWebRtcNode` with the
+`browser` feature on `wasm32-unknown-unknown`. The browser facade starts the
+worker runtime, exposes the local endpoint ID, and provides dial, accept,
+bidirectional stream, and benchmark helpers.
+
+The browser architecture is split by browser API availability:
+
+- Main-thread Wasm owns `RTCPeerConnection`, SDP offer/answer handling, ICE
+  candidate creation, `RTCDataChannel` creation, and browser WebRTC callbacks.
+- Worker Wasm owns Iroh endpoint/session state, application protocol state,
+  packet queues, and the transferred `RTCDataChannel` after attachment.
+
+The `browser_app!` macro can export a main-thread app entry point and a worker
+entry point from one Wasm module. The example at
+`examples/rust-browser-ping-pong` uses this path.
 
 ## Module Map
 
-- `config`: public configuration knobs, including direct-only STUN
-  configuration, queue sizing, frame sizing, and DataChannel backpressure.
-- `transport`: Iroh custom transport integration.
-- `browser`: browser Wasm node facade, main-thread RTC setup, worker startup,
-  and command bridge.
+- `browser`: browser Wasm facade, main-thread RTC setup, worker startup, and
+  worker command bridge.
+- `config`: public configuration knobs, including STUN URLs, queue sizing,
+  frame sizing, and DataChannel backpressure thresholds.
+- `facade`: shared facade configuration and dial options.
 - `native`: native/server WebRTC session backend, enabled by the `native`
   feature on non-wasm targets.
-- `facade`: target-neutral facade configuration and dial options.
+- `transport`: Iroh custom transport integration.
+
+## Feature Flags
+
+- `native`: enables the native WebRTC backend on non-wasm targets.
+- `browser-main-thread`: enables browser `RTCPeerConnection` bindings and the
+  Rust browser facade on `wasm32-unknown-unknown`.
+- `browser-worker`: enables the browser worker entry point on
+  `wasm32-unknown-unknown`.
+- `browser`: enables both browser feature sets.
+
+The default feature set is currently `browser-main-thread` plus `native`.
+
+## Transport Intent
+
+WebRTC is attempted through an explicit dial intent:
+
+- `WebRtcDialOptions::iroh_relay()`: skip WebRTC and use Iroh's normal
+  relay-capable application dial path.
+- `WebRtcDialOptions::webrtc_preferred()`: attempt WebRTC first, then fall back
+  to Iroh relay if WebRTC cannot be promoted.
+- `WebRtcDialOptions::webrtc_only()`: require the WebRTC custom path. If the
+  connection selects a relay/IP path or the wrong WebRTC session path, the dial
+  fails.
+
+`webrtc_preferred()` is the default.
+
+## Bootstrap And Hole Punching
+
+The WebRTC path uses Iroh to establish an authenticated bootstrap stream between
+endpoint IDs. A small bootstrap protocol sends the WebRTC offer, answer, ICE
+candidates, and selected transport intent over that stream.
+
+WebRTC ICE does the candidate gathering and connectivity checks:
+
+```text
+Iroh bootstrap stream
+  -> exchange offer / answer / ICE candidates
+  -> gather host and STUN server-reflexive candidates
+  -> ICE checks candidate pairs
+  -> selected candidate pair opens the DataChannel path
+```
+
+If a direct WebRTC path opens, Iroh/noq packets are sent through the
+`RTCDataChannel` using this crate's custom transport. If WebRTC cannot open, the
+dial intent decides whether to fall back to Iroh relay or surface an error.
+
+TURN is intentionally not modeled by this crate today. `WebRtcIceConfig` accepts
+only `stun:` and `stuns:` URLs. Relay fallback, when allowed, is Iroh relay
+fallback rather than TURN.
 
 ## Encryption And Overhead
 
 The WebRTC path carries framed Iroh/noq packets over an `RTCDataChannel`.
-WebRTC DataChannels run over SCTP over DTLS, so the WebRTC layer is forcing
-transport security underneath the Iroh/noq encrypted connection.
+DataChannels run over SCTP over DTLS. Iroh/noq still owns endpoint identity,
+connection authentication, and encrypted connection semantics above the custom
+transport.
 
-Iroh/noq still owns the endpoint identity, connection authentication, and encrypted connection
-semantics above the custom transport.
-
-But, this means we're forced to have layered encryption and framing..
+That means the WebRTC path has layered encryption and framing:
 
 ```text
 Iroh/noq encrypted packets
@@ -67,82 +147,19 @@ Iroh/noq encrypted packets
   -> ICE-selected path
 ```
 
-This preserves the security and protocol model which let's us speak "Iroh". But, yes, it is not a zero-cost
-transport.
-
-## Hole Punching
-
-We use Iroh relay dial path to create an authenticated bootstrap stream between
-endpoint IDs. A thin WebRTC bootstrap protocol then sends offer/answer and ICE
-candidate messages over that stream.
-
-**WebRTC ICE does the actual hole punching:**
-
-```text
-Iroh relay/bootstrap stream
-  -> exchange offer / answer / ICE candidates
-  -> each peer gathers host and STUN server-reflexive candidates
-  -> ICE connectivity checks race candidate pairs
-  -> selected candidate pair opens the DataChannel path
-```
-
-In the direct path, STUN tells each peer what public address/port its NAT has
-mapped for the WebRTC socket. ICE then tests candidate pairs from both sides.
-If a pair succeeds, the DataChannel uses that path directly. If no direct pair
-succeeds, the dialer's transport intent decides whether the application may use
-Iroh relay or must fail.
-
-References:
-
-- [ICE, RFC 8445](https://datatracker.ietf.org/doc/html/rfc8445): candidate
-  gathering, pairing, and connectivity checks.
-- [STUN, RFC 8489](https://datatracker.ietf.org/doc/html/rfc8489): discovers
-  server-reflexive addresses through NATs.
-- [TURN, RFC 8656](https://datatracker.ietf.org/doc/html/rfc8656): relays
-  traffic when a direct candidate pair cannot be established.
-
-## Transport Intent
-
-True peer-to-peer is the preferred path, but it is not guaranteed. ICE can fail
-to find a direct candidate pair on restrictive NATs, enterprise networks,
-carrier networks, or UDP-blocked paths. Developers should choose what happens
-when the direct WebRTC path cannot be promoted into an open DataChannel.
-
-The browser worker protocol carries an explicit `transportIntent` on every
-bootstrap session:
-
-- `irohRelay`: skip WebRTC and use Iroh's relay-capable application dial path.
-- `webrtcPreferred`: attempt WebRTC first, then close the failed RTC attempt and
-  use Iroh relay if WebRTC cannot be promoted.
-- `webrtcOnly`: require WebRTC. If WebRTC cannot open a transferred
-  DataChannel, surface the error to the application.
-
-The JavaScript dial option `transport` maps directly to this intent. Bootstrap
-signals must include `transportIntent`; missing intent is rejected.
-
-> I created this so I wouldn't feel icky sending things like browser first internet radio traffic entirely though Iroh's relays. Be a respectful consumer: host your own relays, or [work with them](https://www.iroh.computer/pricing)!
-
-TURN is intentionally not included. It's WebRTC P2P or fallback on Iroh. `WebRtcIceConfig` only accepts `stun:` and `stuns:` URLs.
+This preserves the Iroh protocol model, but it is not a zero-cost transport.
 
 ## Tuning Knobs
 
-- `WebRtcIceConfig`: configure direct-only STUN URLs. TURN URLs (see above).
+- `WebRtcIceConfig`: configure direct-only STUN URLs or disable configured ICE
+  servers for localhost/same-LAN tests.
 - `WebRtcFrameConfig`: configure the maximum packet payload accepted by the
-  DataChannel frame encoder/decoder. Default is 1200 bytes.
-- `WebRtcBackpressureConfig`: configure DataChannel buffered amount thresholds
-  and native polling interval.
+  DataChannel frame encoder/decoder. The default is 1200 bytes.
+- `WebRtcDataChannelConfig`: configure DataChannel buffered amount thresholds.
 - `WebRtcQueueConfig`: configure inbound and outbound custom transport queue
   capacity.
-- `WebRtcSessionConfig`: bundle ICE, frame, backpressure, and local ICE queue
-  sizing for browser/native WebRTC sessions.
-
-## Feature Flags
-
-- `native`: enables the native WebRTC backend on non-wasm targets.
-- `browser-main-thread`: enables browser `RTCPeerConnection` bindings and the
-  Rust browser facade on `wasm32-unknown-unknown`.
-- `browser-worker`: enables the browser worker entry point on
-  `wasm32-unknown-unknown`.
+- `WebRtcSessionConfig`: bundle ICE, frame, DataChannel, and local ICE queue
+  settings for browser/native WebRTC sessions.
 
 ## Browser Worker Model
 
@@ -153,25 +170,15 @@ exposes [`RTCPeerConnection`][webrtc-peerconnection] and
 [`RTCDataChannel`][webrtc-datachannel] is exposed to both `Window` and
 `DedicatedWorker` and is transferable.
 
-Practically, this splits browser applications into two roles:
-
-- Main-thread Wasm owns `RTCPeerConnection`, SDP offer/answer handling, ICE
-  candidate creation, `RTCDataChannel` creation, and the browser event
-  callbacks for connection state.
-- Worker Wasm owns the Iroh runtime, application protocol state, session state,
-  packet queues, and the transferred `RTCDataChannel` after attachment.
-
 This distinction matters because WebRTC setup is not just the DataChannel. The
-DataChannel only opens after `RTCPeerConnection` has created an offer or answer,
-applied the remote session description, gathered ICE candidates, exchanged
-remote ICE candidates, selected a candidate pair, and completed DTLS/SCTP setup.
-Those negotiation steps depend on **APIs that are not exposed to workers** in the
-spec, and browser support is especially strict on Safari and iOS. 
+DataChannel only opens after peer connection creation, SDP negotiation, ICE
+candidate exchange, candidate-pair selection, and DTLS/SCTP setup. Those setup
+steps depend on APIs that are not consistently exposed to workers across the
+browsers this crate targets.
 
-The two Wasm entry points communicate over a dedicated `MessagePort`.
-Transferred `RTCDataChannel` support is mandatory for the product browser path.
-The crate no longer includes a browser packet bridge or browser-owned session
-harness.
+The crate's browser path therefore uses a main-thread RTC control bridge plus a
+worker-owned Iroh runtime. Transferred `RTCDataChannel` support is required for
+the browser product path.
 
 [webrtc-peerconnection]: https://w3c.github.io/webrtc-pc/#rtcpeerconnection-interface
 [webrtc-ice-candidate]: https://w3c.github.io/webrtc-pc/#rtcicecandidate-interface

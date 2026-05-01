@@ -62,8 +62,8 @@ pub enum WebRtcAddrKind {
 /// The normal application-level API should hide this type. Most consumers
 /// should dial by endpoint id and let the worker runtime create session
 /// addresses internally. Consumers only need to construct `WebRtcAddr` directly
-/// when manually wiring [`WebRtcTransport`](crate::WebRtcTransport),
-/// [`SessionHub`](crate::SessionHub), and Iroh `EndpointAddr` values.
+/// when manually wiring the low-level WebRTC custom transport, session hub, and
+/// Iroh `EndpointAddr` values.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WebRtcAddr {
     /// Iroh identity this virtual WebRTC address belongs to.

@@ -1,3 +1,5 @@
+//! Iroh custom transport integration for WebRTC-backed packet delivery.
+
 use std::{io, num::NonZeroUsize, sync::Arc};
 
 use iroh::endpoint::{
@@ -22,6 +24,7 @@ pub struct WebRtcQueueConfig {
 }
 
 impl WebRtcQueueConfig {
+    /// Validate that both packet queues can hold at least one packet.
     pub fn validate(&self) -> Result<()> {
         if self.recv_capacity == 0 || self.send_capacity == 0 {
             return Err(Error::InvalidConfig(
@@ -41,6 +44,7 @@ impl Default for WebRtcQueueConfig {
     }
 }
 
+/// Configuration for the WebRTC custom transport registered on an Iroh endpoint.
 #[derive(Debug, Clone)]
 pub struct WebRtcTransportConfig {
     /// Optional local virtual WebRTC custom address advertised to Iroh/noq.
@@ -54,6 +58,7 @@ pub struct WebRtcTransportConfig {
     pub max_transmit_segments: NonZeroUsize,
 }
 
+/// Iroh custom transport that routes WebRTC packets through a shared session hub.
 #[derive(Debug, Clone)]
 pub struct WebRtcTransport {
     config: WebRtcTransportConfig,
@@ -62,10 +67,12 @@ pub struct WebRtcTransport {
 }
 
 impl WebRtcTransport {
+    /// Create a WebRTC custom transport, panicking if `config` is invalid.
     pub fn new(config: WebRtcTransportConfig) -> Self {
         Self::try_new(config).expect("invalid WebRTC transport configuration")
     }
 
+    /// Create a WebRTC custom transport after validating `config`.
     pub fn try_new(config: WebRtcTransportConfig) -> Result<Self> {
         config.queues.validate()?;
         config.frame.validate()?;
@@ -89,14 +96,17 @@ impl WebRtcTransport {
         })
     }
 
+    /// Return the shared session hub used by WebRTC session pumps.
     pub fn session_hub(&self) -> SessionHub {
         self.hub.clone()
     }
 
+    /// Return the currently advertised local custom transport addresses.
     pub fn local_addrs(&self) -> Vec<iroh_base::CustomAddr> {
         self.local_addrs.get()
     }
 
+    /// Add one local custom transport address to the endpoint advertisement set.
     pub fn advertise_local_addr(&self, addr: iroh_base::CustomAddr) {
         let mut local_addrs = self.local_addrs.get();
         if local_addrs.iter().any(|existing| existing == &addr) {
@@ -119,6 +129,7 @@ impl WebRtcTransport {
         );
     }
 
+    /// Replace the complete local custom transport address advertisement set.
     pub fn set_local_addrs(&self, addrs: Vec<iroh_base::CustomAddr>) {
         let _ = self.local_addrs.set(addrs.clone());
         tracing::trace!(
@@ -145,6 +156,7 @@ impl CustomTransport for WebRtcTransport {
     }
 }
 
+/// Register a WebRTC custom transport with an Iroh endpoint builder.
 pub fn configure_endpoint(builder: Builder, transport: WebRtcTransport) -> Builder {
     builder.add_custom_transport(Arc::new(transport))
 }

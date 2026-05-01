@@ -6,9 +6,13 @@
 use crate::error::{Error, Result};
 pub use crate::transport::{WebRtcQueueConfig, WebRtcTransportConfig};
 
+/// Default number of local ICE events buffered per native or browser WebRTC session.
 pub const DEFAULT_LOCAL_ICE_QUEUE_CAPACITY: usize = 128;
+/// Default per-session packet queue capacity for inbound and outbound custom transport packets.
 pub const DEFAULT_SESSION_QUEUE_CAPACITY: usize = 1024;
+/// Default DataChannel buffered amount that resumes a paused outbound pump.
 pub const DEFAULT_DATA_CHANNEL_BUFFERED_AMOUNT_LOW_THRESHOLD: usize = 4 * 1024 * 1024;
+/// Default DataChannel buffered amount that pauses a per-session outbound pump.
 pub const DEFAULT_DATA_CHANNEL_BUFFERED_AMOUNT_HIGH_THRESHOLD: usize = 16 * 1024 * 1024;
 
 /// Direct-only ICE server configuration.
@@ -48,12 +52,14 @@ impl WebRtcIceConfig {
         }
     }
 
+    /// Build the default direct-STUN configuration.
     pub fn default_direct_stun() -> Self {
         Self {
             stun_urls: vec!["stun:stun.l.google.com:19302".into()],
         }
     }
 
+    /// Validate that all configured ICE server URLs are STUN or STUNS URLs.
     pub fn validate_direct_only(&self) -> Result<()> {
         for url in &self.stun_urls {
             validate_stun_url(url.clone())?;
@@ -76,6 +82,7 @@ pub struct WebRtcFrameConfig {
 }
 
 impl WebRtcFrameConfig {
+    /// Validate the packet frame size limits.
     pub fn validate(&self) -> Result<()> {
         if self.max_payload_len == 0 || self.max_payload_len > u16::MAX as usize {
             return Err(Error::InvalidConfig(
@@ -106,6 +113,7 @@ pub struct WebRtcDataChannelConfig {
 }
 
 impl WebRtcDataChannelConfig {
+    /// Validate the DataChannel buffered amount thresholds.
     pub fn validate(&self) -> Result<()> {
         if self.buffered_amount_low_threshold > u32::MAX as usize
             || self.buffered_amount_high_threshold > u32::MAX as usize
@@ -147,6 +155,7 @@ pub struct WebRtcSessionConfig {
 }
 
 impl WebRtcSessionConfig {
+    /// Build a session config with explicit direct-STUN URLs.
     pub fn direct_stun(stun_urls: impl IntoIterator<Item = impl Into<String>>) -> Result<Self> {
         Ok(Self {
             ice: WebRtcIceConfig::direct_only(stun_urls)?,
@@ -154,6 +163,7 @@ impl WebRtcSessionConfig {
         })
     }
 
+    /// Build a session config using the crate's default direct-STUN server.
     pub fn default_direct_stun() -> Self {
         Self {
             ice: WebRtcIceConfig::default_direct_stun(),
@@ -175,6 +185,7 @@ impl WebRtcSessionConfig {
         }
     }
 
+    /// Validate all per-session tuning knobs.
     pub fn validate(&self) -> Result<()> {
         self.ice.validate_direct_only()?;
         self.frame.validate()?;

@@ -45,6 +45,7 @@ pub use crate::core::{
 /// Native-facing alias for the shared per-session WebRTC configuration.
 pub type NativeWebRtcSessionConfig = WebRtcSessionConfig;
 
+/// Native WebRTC peer connection bound to one Iroh custom transport session.
 #[derive(Debug, Clone)]
 pub struct NativeWebRtcSession {
     peer: Arc<RTCPeerConnection>,
@@ -52,6 +53,7 @@ pub struct NativeWebRtcSession {
 }
 
 impl NativeWebRtcSession {
+    /// Create an initiating native session and attach an outbound DataChannel.
     pub async fn new_offerer_with_config(
         hub: SessionHub,
         remote_addr: CustomAddr,
@@ -76,6 +78,7 @@ impl NativeWebRtcSession {
         Ok(session)
     }
 
+    /// Create an answering native session that accepts the remote DataChannel.
     pub async fn new_answerer_with_config(
         hub: SessionHub,
         remote_addr: CustomAddr,
@@ -150,6 +153,7 @@ impl NativeWebRtcSession {
         Ok(Self { peer, local_ice })
     }
 
+    /// Create and apply a WebRTC offer.
     pub async fn create_offer(&self) -> Result<String> {
         self.create_offer_with_ice_restart(false).await
     }
@@ -172,6 +176,7 @@ impl NativeWebRtcSession {
         Ok(normalize_sdp(sdp))
     }
 
+    /// Apply a remote WebRTC answer SDP.
     pub async fn apply_answer(&self, sdp: String) -> Result<()> {
         self.peer
             .set_remote_description(
@@ -181,6 +186,7 @@ impl NativeWebRtcSession {
             .map_err(native_error)
     }
 
+    /// Apply a remote WebRTC offer SDP.
     pub async fn apply_offer(&self, sdp: String) -> Result<()> {
         self.peer
             .set_remote_description(
@@ -190,6 +196,7 @@ impl NativeWebRtcSession {
             .map_err(native_error)
     }
 
+    /// Create and apply a WebRTC answer.
     pub async fn create_answer(&self) -> Result<String> {
         let answer = self.peer.create_answer(None).await.map_err(native_error)?;
         let sdp = answer.sdp.clone();
@@ -200,6 +207,7 @@ impl NativeWebRtcSession {
         Ok(normalize_sdp(sdp))
     }
 
+    /// Add one remote ICE candidate.
     pub async fn add_ice_candidate(&self, candidate: WebRtcIceCandidate) -> Result<()> {
         self.peer
             .add_ice_candidate(RTCIceCandidateInit {
@@ -212,6 +220,7 @@ impl NativeWebRtcSession {
             .map_err(native_error)
     }
 
+    /// Signal that the remote peer has no more ICE candidates.
     pub async fn add_end_of_candidates(&self) -> Result<()> {
         self.peer
             .add_ice_candidate(RTCIceCandidateInit {
@@ -224,10 +233,12 @@ impl NativeWebRtcSession {
             .map_err(native_error)
     }
 
+    /// Wait for the next locally gathered ICE event.
     pub async fn next_local_ice(&self) -> Result<LocalIceEvent> {
         self.local_ice.next().await
     }
 
+    /// Close the native WebRTC peer connection and local ICE queue.
     pub async fn close(&self) {
         self.local_ice.close();
         if let Err(err) = self.peer.close().await {
