@@ -1,14 +1,12 @@
 use super::*;
-use super::{capabilities::*, js_wire::*, rtc::*, rtc_control_wire::*};
+use super::{capabilities::*, js_boundary::*, rtc::*};
 use crate::error::{Error, Result};
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
-pub(super) struct WebRtcMainThreadRegistry {
-    sessions: Rc<RefCell<HashMap<String, MainThreadSession>>>,
-    rtc_control_port: Rc<RefCell<Option<MainThreadRtcControlPort>>>,
+pub(crate) struct BrowserRtcRegistry {
+    sessions: Rc<RefCell<HashMap<String, BrowserRtcSession>>>,
 }
 
-struct MainThreadSession {
+struct BrowserRtcSession {
     peer: RtcPeerConnection,
     local_ice: LocalIceQueue,
     incoming_data_channels: Rc<RefCell<VecDeque<RtcDataChannel>>>,
@@ -17,223 +15,30 @@ struct MainThreadSession {
     _data_channel_handler: Closure<dyn FnMut(RtcDataChannelEvent)>,
 }
 
-struct MainThreadRtcControlPort {
-    port: MessagePort,
-    _message_handler: Closure<dyn FnMut(MessageEvent)>,
-}
-
-impl WebRtcMainThreadRegistry {
+impl BrowserRtcRegistry {
     pub(super) fn new() -> Self {
         Self {
             sessions: Rc::new(RefCell::new(HashMap::new())),
-            rtc_control_port: Rc::new(RefCell::new(None)),
-        }
-    }
-
-    pub(super) fn attach_rtc_control_port(
-        &self,
-        port: MessagePort,
-    ) -> std::result::Result<(), JsValue> {
-        self.detach_rtc_control_port();
-
-        let handler_registry = self.clone_for_port_handler();
-        let handler_port = port.clone();
-        let message_handler = Closure::wrap(Box::new(move |event: MessageEvent| {
-            let registry = handler_registry.clone_for_port_handler();
-            let response_port = handler_port.clone();
-            let message = event.data();
-            spawn_local(async move {
-                registry
-                    .handle_rtc_control_port_message(response_port, message)
-                    .await;
-            });
-        }) as Box<dyn FnMut(_)>);
-
-        port.set_onmessage(Some(message_handler.as_ref().unchecked_ref()));
-        port.start();
-        *self.rtc_control_port.borrow_mut() = Some(MainThreadRtcControlPort {
-            port,
-            _message_handler: message_handler,
-        });
-        Ok(())
-    }
-
-    pub(super) fn detach_rtc_control_port(&self) {
-        if let Some(binding) = self.rtc_control_port.borrow_mut().take() {
-            binding.port.set_onmessage(None);
-            binding.port.close();
         }
     }
 }
 
-impl Clone for WebRtcMainThreadRegistry {
+impl Clone for BrowserRtcRegistry {
     fn clone(&self) -> Self {
         Self {
             sessions: self.sessions.clone(),
-            rtc_control_port: self.rtc_control_port.clone(),
         }
     }
 }
 
-impl WebRtcMainThreadRegistry {
-    fn clone_for_port_handler(&self) -> Self {
-        Self {
-            sessions: self.sessions.clone(),
-            rtc_control_port: self.rtc_control_port.clone(),
-        }
-    }
-
-    async fn handle_rtc_control_port_message(&self, port: MessagePort, message: JsValue) {
-        match rtc_control_request_from_js(&message) {
-            Ok(request) => {
-                let response = match self
-                    .try_handle_command(&request.command, request.payload)
-                    .await
-                {
-                    Ok(result) => {
-                        let transfer = match transfer_list_for_main_rtc_result(&result) {
-                            Ok(transfer) => transfer,
-                            Err(error) => {
-                                let wire_error =
-                                    error_to_wire_value_for_command(Some(&request.command), error);
-                                let response = rtc_control_error_response(request.id, wire_error);
-                                let _ = post_rtc_control_response(&port, response, None);
-                                return;
-                            }
-                        };
-                        rtc_control_success_response(request.id, result)
-                            .map(|response| (response, Some(transfer)))
-                    }
-                    Err(error) => {
-                        let wire_error =
-                            error_to_wire_value_for_command(Some(&request.command), error);
-                        Ok((rtc_control_error_response(request.id, wire_error), None))
-                    }
-                };
-
-                if let Ok((response, transfer)) = response {
-                    if let Err(error) =
-                        post_rtc_control_response(&port, response, transfer.as_ref())
-                    {
-                        let wire_error =
-                            error_to_wire_value_for_command(Some(&request.command), error);
-                        let response = rtc_control_error_response(request.id, wire_error);
-                        let _ = post_rtc_control_response(&port, response, None);
-                    }
-                }
-            }
-            Err(error) => {
-                if let Some(id) = rtc_control_message_id(&message) {
-                    let wire_error = error_to_wire_value_for_command(None, error);
-                    let response = rtc_control_error_response(id, wire_error);
-                    let _ = post_rtc_control_response(&port, response, None);
-                }
-            }
-        }
-    }
-
-    async fn try_handle_command(&self, command: &str, payload: JsValue) -> Result<JsValue> {
-        match command {
-            MAIN_RTC_CREATE_PEER_CONNECTION_COMMAND => {
-                let request: MainRtcCreatePeerConnectionPayload =
-                    decode_command_payload(command, payload)?;
-                self.try_create_peer_connection(request.session_key.clone(), request.stun_urls)?;
-                encode_command_result(
-                    command,
-                    &MainRtcCreatePeerConnectionResult {
-                        session_key: request.session_key.clone(),
-                        peer_connection_key: request.session_key,
-                    },
-                )
-            }
-            MAIN_RTC_CREATE_DATA_CHANNEL_COMMAND => {
-                let request: MainRtcCreateDataChannelPayload =
-                    decode_command_payload(command, payload)?;
-                let channel = self.try_create_data_channel_with_options(
-                    &request.session_key,
-                    request.label.as_deref(),
-                    request.protocol.as_deref(),
-                    request.ordered.unwrap_or(false),
-                    request.max_retransmits.unwrap_or(0),
-                )?;
-                encode_command_result(
-                    command,
-                    &MainRtcDataChannelResult {
-                        session_key: request.session_key,
-                        channel,
-                    },
-                )
-            }
-            MAIN_RTC_TAKE_DATA_CHANNEL_COMMAND => {
-                let request: MainRtcSessionPayload = decode_command_payload(command, payload)?;
-                let channel = self.wait_next_data_channel(&request.session_key).await?;
-                validate_data_channel_transferable(&channel)?;
-                encode_command_result(
-                    command,
-                    &MainRtcDataChannelResult {
-                        session_key: request.session_key,
-                        channel,
-                    },
-                )
-            }
-            MAIN_RTC_CREATE_OFFER_COMMAND => {
-                let request: MainRtcSessionPayload = decode_command_payload(command, payload)?;
-                let peer = self.peer_for(&request.session_key)?;
-                let sdp = create_offer_for_peer(&peer).await?;
-                encode_command_result(command, &MainRtcSdpResult { sdp })
-            }
-            MAIN_RTC_ACCEPT_OFFER_COMMAND => {
-                let request: MainRtcSessionSdpPayload = decode_command_payload(command, payload)?;
-                let peer = self.peer_for(&request.session_key)?;
-                set_remote_description_for_peer(&peer, RtcSdpType::Offer, &request.sdp).await?;
-                encode_command_result(command, &MainRtcEmptyResult {})
-            }
-            MAIN_RTC_CREATE_ANSWER_COMMAND => {
-                let request: MainRtcSessionPayload = decode_command_payload(command, payload)?;
-                let peer = self.peer_for(&request.session_key)?;
-                let sdp = create_answer_for_peer(&peer).await?;
-                encode_command_result(command, &MainRtcSdpResult { sdp })
-            }
-            MAIN_RTC_ACCEPT_ANSWER_COMMAND => {
-                let request: MainRtcSessionSdpPayload = decode_command_payload(command, payload)?;
-                let peer = self.peer_for(&request.session_key)?;
-                set_remote_description_for_peer(&peer, RtcSdpType::Answer, &request.sdp).await?;
-                encode_command_result(command, &MainRtcEmptyResult {})
-            }
-            MAIN_RTC_NEXT_LOCAL_ICE_COMMAND => {
-                let request: MainRtcSessionPayload = decode_command_payload(command, payload)?;
-                let local_ice = self.local_ice_for(&request.session_key)?;
-                local_ice.next().await.and_then(local_ice_to_js)
-            }
-            MAIN_RTC_ADD_REMOTE_ICE_COMMAND => {
-                let request: MainRtcAddRemoteIcePayload = decode_command_payload(command, payload)?;
-                let peer = self.peer_for(&request.session_key)?;
-                match local_ice_from_payload(request.ice) {
-                    LocalIceEvent::Candidate(candidate) => {
-                        add_ice_candidate_for_peer(&peer, &candidate).await?;
-                    }
-                    LocalIceEvent::EndOfCandidates => {
-                        add_end_of_candidates_for_peer(&peer).await?;
-                    }
-                }
-                encode_command_result(command, &MainRtcEmptyResult {})
-            }
-            MAIN_RTC_CLOSE_PEER_CONNECTION_COMMAND => {
-                let request: MainRtcClosePeerConnectionPayload =
-                    decode_command_payload(command, payload)?;
-                self.try_close_peer_connection(&request.session_key)?;
-                encode_command_result(command, &MainRtcCloseResult { closed: true })
-            }
-            _ => Err(Error::WebRtc(format!(
-                "unknown main-thread RTC command: {command}"
-            ))),
-        }
-    }
-
-    fn try_create_peer_connection(
+impl BrowserRtcRegistry {
+    pub(crate) fn create_peer_connection(
         &self,
         session_key: String,
+        _role: BrowserRtcSessionRole,
+        _generation: u64,
         stun_urls: Option<Vec<String>>,
+        _remote_endpoint: String,
     ) -> Result<()> {
         validate_rtc_peer_connection_available()?;
         validate_session_key(&session_key)?;
@@ -287,7 +92,7 @@ impl WebRtcMainThreadRegistry {
 
         self.sessions.borrow_mut().insert(
             session_key.clone(),
-            MainThreadSession {
+            BrowserRtcSession {
                 peer,
                 local_ice,
                 incoming_data_channels,
@@ -299,7 +104,7 @@ impl WebRtcMainThreadRegistry {
         Ok(())
     }
 
-    fn try_create_data_channel_with_options(
+    pub(crate) fn create_data_channel(
         &self,
         session_key: &str,
         label: Option<&str>,
@@ -331,6 +136,65 @@ impl WebRtcMainThreadRegistry {
         channel.set_binary_type(RtcDataChannelType::Arraybuffer);
         validate_data_channel_transferable(&channel)?;
         Ok(channel)
+    }
+
+    pub(crate) async fn take_data_channel(&self, session_key: &str) -> Result<RtcDataChannel> {
+        self.wait_next_data_channel(session_key).await
+    }
+
+    pub(crate) async fn create_offer(&self, session_key: &str) -> Result<String> {
+        let peer = self.peer_for(session_key)?;
+        create_offer_for_peer(&peer).await
+    }
+
+    pub(crate) async fn accept_offer(
+        &self,
+        session_key: &str,
+        _remote_endpoint: Option<String>,
+        sdp: &str,
+    ) -> Result<()> {
+        let peer = self.peer_for(session_key)?;
+        set_remote_description_for_peer(&peer, RtcSdpType::Offer, sdp).await
+    }
+
+    pub(crate) async fn create_answer(&self, session_key: &str) -> Result<String> {
+        let peer = self.peer_for(session_key)?;
+        create_answer_for_peer(&peer).await
+    }
+
+    pub(crate) async fn accept_answer(&self, session_key: &str, sdp: &str) -> Result<()> {
+        let peer = self.peer_for(session_key)?;
+        set_remote_description_for_peer(&peer, RtcSdpType::Answer, sdp).await
+    }
+
+    pub(crate) async fn next_local_ice(&self, session_key: &str) -> Result<BrowserIceCandidate> {
+        let local_ice = self.local_ice_for(session_key)?;
+        local_ice.next().await
+    }
+
+    pub(crate) async fn add_remote_ice(
+        &self,
+        session_key: &str,
+        ice: BrowserIceCandidate,
+    ) -> Result<()> {
+        let peer = self.peer_for(session_key)?;
+        match ice {
+            LocalIceEvent::Candidate(candidate) => {
+                add_ice_candidate_for_peer(&peer, &candidate).await?;
+            }
+            LocalIceEvent::EndOfCandidates => {
+                add_end_of_candidates_for_peer(&peer).await?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn close_peer_connection(
+        &self,
+        session_key: &str,
+        _reason: Option<String>,
+    ) -> Result<()> {
+        self.try_close_peer_connection(session_key)
     }
 
     fn try_take_next_data_channel(&self, session_key: &str) -> Result<Option<RtcDataChannel>> {
@@ -404,92 +268,10 @@ impl WebRtcMainThreadRegistry {
     }
 }
 
-fn decode_command_payload<T: DeserializeOwned>(command: &str, payload: JsValue) -> Result<T> {
-    serde_wasm_bindgen::from_value(payload)
-        .map_err(|err| Error::WebRtc(format!("malformed payload for {command}: {err}")))
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BrowserRtcSessionRole {
+    Dialer,
+    Acceptor,
 }
 
-fn encode_command_result<T: Serialize>(command: &str, result: &T) -> Result<JsValue> {
-    serde_wasm_bindgen::to_value(result)
-        .map_err(|err| Error::WebRtc(format!("failed to encode result for {command}: {err}")))
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct MainRtcCreatePeerConnectionPayload {
-    session_key: String,
-    #[serde(default)]
-    stun_urls: Option<Vec<String>>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct MainRtcCreateDataChannelPayload {
-    session_key: String,
-    #[serde(default)]
-    label: Option<String>,
-    #[serde(default)]
-    protocol: Option<String>,
-    #[serde(default)]
-    ordered: Option<bool>,
-    #[serde(default)]
-    max_retransmits: Option<u16>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct MainRtcSessionPayload {
-    session_key: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct MainRtcSessionSdpPayload {
-    session_key: String,
-    sdp: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct MainRtcAddRemoteIcePayload {
-    session_key: String,
-    ice: MainRtcIcePayload,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct MainRtcClosePeerConnectionPayload {
-    session_key: String,
-    #[serde(default)]
-    _reason: Option<String>,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct MainRtcCreatePeerConnectionResult {
-    session_key: String,
-    peer_connection_key: String,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct MainRtcDataChannelResult {
-    session_key: String,
-    #[serde(with = "serde_wasm_bindgen::preserve")]
-    channel: RtcDataChannel,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct MainRtcSdpResult {
-    sdp: String,
-}
-
-#[derive(Serialize)]
-#[serde(rename_all = "camelCase")]
-struct MainRtcCloseResult {
-    closed: bool,
-}
-
-#[derive(Serialize)]
-struct MainRtcEmptyResult {}
+pub(crate) type BrowserIceCandidate = LocalIceEvent;

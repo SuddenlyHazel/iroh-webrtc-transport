@@ -1,0 +1,8 @@
+{
+  "rust-analyzer.cargo.allTargets": true,
+  "rust-analyzer.linkedProjects": [
+    "crates/iroh-webrtc-transport/Cargo.toml",
+    "examples/rust-browser-chat-room/Cargo.toml",
+    "examples/rust-browser-ping-pong/Cargo.toml"
+  ]
+}

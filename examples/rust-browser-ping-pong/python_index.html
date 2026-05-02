@@ -20,12 +20,6 @@
 
       await init({ module_or_path: "./__APP_WASM__" });
 
-      globalThis.createIrohWebRtcWorker = bindings.createIrohWebRtcWorkerFactoryForModule(
-        new URL("./__APP_JS__", import.meta.url).href,
-        bindings.__iroh_webrtc_wasm_module(),
-        "start_iroh_webrtc_worker",
-      );
-
       await bindings.start_app();
     </script>
   </body>
