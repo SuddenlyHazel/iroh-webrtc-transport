@@ -11,7 +11,7 @@ use crate::{
     config::WebRtcIceConfig,
     core::signaling::BootstrapTransportIntent,
 };
-use iroh::{EndpointAddr, EndpointId};
+use iroh::{EndpointAddr, EndpointId, SecretKey};
 use std::str::FromStr as _;
 use wasm_bindgen::JsValue;
 
@@ -153,6 +153,7 @@ struct BrowserWebRtcNodeInner {
 
 pub struct BrowserWebRtcNodeBuilder {
     config: BrowserWebRtcNodeConfig,
+    secret_key: SecretKey,
     facade_alpns: Vec<String>,
     benchmark_echo_alpns: Vec<String>,
     protocols: BrowserProtocolRegistry,
@@ -196,17 +197,24 @@ impl BrowserWebRtcNodeBuilder {
 }
 
 impl BrowserWebRtcNode {
-    pub fn builder(config: BrowserWebRtcNodeConfig) -> BrowserWebRtcNodeBuilder {
+    pub fn builder(
+        config: BrowserWebRtcNodeConfig,
+        secret_key: SecretKey,
+    ) -> BrowserWebRtcNodeBuilder {
         BrowserWebRtcNodeBuilder {
             config,
+            secret_key,
             facade_alpns: Vec::new(),
             benchmark_echo_alpns: Vec::new(),
             protocols: BrowserProtocolRegistry::new(),
         }
     }
 
-    pub async fn spawn(config: BrowserWebRtcNodeConfig) -> Result<Self, JsValue> {
-        Self::builder(config).spawn().await
+    pub async fn spawn(
+        config: BrowserWebRtcNodeConfig,
+        secret_key: SecretKey,
+    ) -> Result<Self, JsValue> {
+        Self::builder(config, secret_key).spawn().await
     }
 
     pub fn endpoint_id(&self) -> &str {
@@ -460,6 +468,7 @@ impl BrowserRuntime {
     ) -> Result<BrowserNodeInfo, JsValue> {
         self.spawn(
             builder.config.stun_urls.clone(),
+            builder.secret_key.clone(),
             builder.config.low_latency_quic_acks,
             builder.config.protocol_transport_preference.as_intent(),
             builder.facade_alpns.clone(),

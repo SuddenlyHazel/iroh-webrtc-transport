@@ -1586,6 +1586,7 @@ name = "iroh-webrtc-rust-browser-ping-pong"
 version = "0.0.0"
 dependencies = [
  "console_error_panic_hook",
+ "iroh",
  "iroh-webrtc-transport",
  "qrcode",
  "tracing",
@@ -1596,7 +1597,7 @@ dependencies = [
 
 [[package]]
 name = "iroh-webrtc-transport"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "anyhow",
  "blake3",

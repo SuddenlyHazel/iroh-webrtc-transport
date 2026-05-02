@@ -1969,7 +1969,7 @@ dependencies = [
 
 [[package]]
 name = "iroh-webrtc-transport"
-version = "0.1.0-alpha.1"
+version = "0.1.0-alpha.2"
 dependencies = [
  "anyhow",
  "blake3",

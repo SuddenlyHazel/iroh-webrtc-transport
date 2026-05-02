@@ -29,6 +29,7 @@ impl BrowserRuntimeCore {
     pub(in crate::browser_runtime) async fn spawn_node(
         &self,
         mut config: BrowserRuntimeNodeConfig,
+        secret_key: SecretKey,
         bootstrap_connection_tx: Option<mpsc::UnboundedSender<Connection>>,
     ) -> BrowserRuntimeResult<BrowserNodeInfo> {
         let _spawn_guard = self.spawn_lock.lock().await;
@@ -43,7 +44,7 @@ impl BrowserRuntimeCore {
         }
         let node = BrowserRuntimeNode::spawn_with_secret_key(
             config,
-            SecretKey::generate(),
+            secret_key,
             self.browser_protocols.clone(),
         )?;
         if bootstrap_connection_tx.is_some() {

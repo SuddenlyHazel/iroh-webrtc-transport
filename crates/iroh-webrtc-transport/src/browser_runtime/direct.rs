@@ -73,6 +73,7 @@ impl BrowserRuntime {
     pub(crate) async fn spawn(
         &self,
         stun_urls: Vec<String>,
+        secret_key: SecretKey,
         low_latency_quic_acks: bool,
         protocol_transport_intent: BootstrapTransportIntent,
         facade_alpns: Vec<String>,
@@ -93,7 +94,11 @@ impl BrowserRuntime {
         .map_err(|err| runtime_error_to_js(err))?;
         let result = self
             .core
-            .spawn_node(config, Some(self.bootstrap.connection_tx.clone()))
+            .spawn_node(
+                config,
+                secret_key,
+                Some(self.bootstrap.connection_tx.clone()),
+            )
             .await
             .map_err(|err| runtime_error_to_js(err))?;
         Ok(result)

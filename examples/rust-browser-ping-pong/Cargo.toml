@@ -9,6 +9,7 @@ crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 console_error_panic_hook = "0.1"
+iroh = { version = "0.98", default-features = false }
 iroh-webrtc-transport = { path = "../../crates/iroh-webrtc-transport", default-features = false, features = ["browser"] }
 qrcode = { version = "0.14.1", default-features = false, features = ["svg"] }
 tracing = "0.1"

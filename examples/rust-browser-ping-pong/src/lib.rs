@@ -1,3 +1,4 @@
+use iroh::SecretKey;
 use iroh_webrtc_transport::browser::{
     BrowserDialOptions, BrowserWebRtcNode, BrowserWebRtcNodeConfig,
 };
@@ -33,8 +34,10 @@ async fn run_app() -> Result<(), JsValue> {
     let action_buttons = vec![ping.clone(), latency.clone(), throughput.clone()];
 
     let low_latency_quic_acks = query_flag("lowLatencyQuicAcks")?;
+    let secret_key = SecretKey::generate();
     let node = BrowserWebRtcNode::builder(
         BrowserWebRtcNodeConfig::default().with_low_latency_quic_acks(low_latency_quic_acks),
+        secret_key,
     )
     .accept_facade(ALPN)
     .accept_latency_echo(BENCHMARK_ALPN)

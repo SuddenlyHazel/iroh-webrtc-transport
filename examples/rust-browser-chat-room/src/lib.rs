@@ -7,7 +7,7 @@ use std::{
 };
 
 use bytes::Bytes;
-use iroh::{Endpoint, EndpointId};
+use iroh::{Endpoint, EndpointId, SecretKey};
 use iroh_gossip::{
     TopicId,
     api::{Event as GossipEvent, GossipSender},
@@ -333,9 +333,11 @@ async fn run_app() -> std::result::Result<(), JsValue> {
 
     let document = document()?;
     let local = element::<HtmlInputElement>(&document, "local")?;
+    let secret_key = SecretKey::generate();
     let node = BrowserWebRtcNode::builder(
         BrowserWebRtcNodeConfig::default()
             .with_protocol_transport_preference(BrowserDialTransportPreference::WebRtcOnly),
+        secret_key,
     )
     .protocol(ChatGossipProtocol::default())
     .map_err(|err| JsValue::from_str(&err))?
