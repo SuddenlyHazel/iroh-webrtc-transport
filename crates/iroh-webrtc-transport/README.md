@@ -55,25 +55,24 @@ for inbound application protocols.
 ## Basic Browser Shape
 
 Browser applications should use `browser::BrowserWebRtcNode` with the
-`browser` feature on `wasm32-unknown-unknown`. The browser facade starts the
-worker runtime, exposes the local endpoint ID, and provides dial, accept,
-bidirectional stream, and benchmark helpers.
+`browser` feature on `wasm32-unknown-unknown`. The browser facade owns the
+main-thread runtime, exposes the local endpoint ID, and provides dial, accept,
+bidirectional stream, typed protocol, and benchmark helpers.
 
-The browser architecture is split by browser API availability:
+The browser architecture is single-runtime in this branch:
 
-- Main-thread Wasm owns `RTCPeerConnection`, SDP offer/answer handling, ICE
-  candidate creation, `RTCDataChannel` creation, and browser WebRTC callbacks.
-- Worker Wasm owns Iroh endpoint/session state, application protocol state,
-  packet queues, and the transferred `RTCDataChannel` after attachment.
+- Main-thread Wasm owns Iroh endpoint/session state, application protocol
+  state, packet queues, `RTCPeerConnection`, SDP/ICE, and `RTCDataChannel`
+  packet I/O.
+- There is no browser worker, `MessagePort` RTC control channel, worker command
+  bridge, or DataChannel transfer between threads.
 
-The `browser_app!` macro can export a main-thread app entry point and a worker
-entry point from one Wasm module. The example at
-`examples/rust-browser-ping-pong` uses this path.
+The `browser_app!` macro exports the main-thread app entry point.
 
 ## Module Map
 
-- `browser`: browser Wasm facade, main-thread RTC setup, worker startup, and
-  worker command bridge.
+- `browser`: browser Wasm facade, main-thread RTC setup, endpoint/session
+  runtime, typed protocols, streams, and benchmark helpers.
 - `config`: public configuration knobs, including STUN URLs, queue sizing,
   frame sizing, and DataChannel backpressure thresholds.
 - `facade`: shared facade configuration and dial options.
@@ -84,13 +83,11 @@ entry point from one Wasm module. The example at
 ## Feature Flags
 
 - `native`: enables the native WebRTC backend on non-wasm targets.
-- `browser-main-thread`: enables browser `RTCPeerConnection` bindings and the
-  Rust browser facade on `wasm32-unknown-unknown`.
-- `browser-worker`: enables the browser worker entry point on
+- `browser`: enables the browser main-thread runtime on
   `wasm32-unknown-unknown`.
-- `browser`: enables both browser feature sets.
+- `browser-main-thread`: internal alias used by the browser feature.
 
-The default feature set is currently `browser-main-thread` plus `native`.
+The default feature set is currently `browser` plus `native`.
 
 ## Transport Intent
 
@@ -161,24 +158,13 @@ This preserves the Iroh protocol model, but it is not a zero-cost transport.
 - `WebRtcSessionConfig`: bundle ICE, frame, DataChannel, and local ICE queue
   settings for browser/native WebRTC sessions.
 
-## Browser Worker Model
+## Browser Main-Thread Model
 
-For browser applications that run Iroh/Wasm in a worker, keep
-`RTCPeerConnection` orchestration on the browser main thread. The WebRTC spec
-exposes [`RTCPeerConnection`][webrtc-peerconnection] and
-[`RTCIceCandidate`][webrtc-ice-candidate] to `Window`, while
-[`RTCDataChannel`][webrtc-datachannel] is exposed to both `Window` and
-`DedicatedWorker` and is transferable.
-
-This distinction matters because WebRTC setup is not just the DataChannel. The
-DataChannel only opens after peer connection creation, SDP negotiation, ICE
-candidate exchange, candidate-pair selection, and DTLS/SCTP setup. Those setup
-steps depend on APIs that are not consistently exposed to workers across the
-browsers this crate targets.
-
-The crate's browser path therefore uses a main-thread RTC control bridge plus a
-worker-owned Iroh runtime. Transferred `RTCDataChannel` support is required for
-the browser product path.
+This branch intentionally keeps all browser state in the main-thread Wasm
+runtime. That includes endpoint keys, session state, application protocol
+handlers, WebRTC negotiation, DataChannel handlers, and packet queues. The goal
+is to evaluate whether removing the worker RPC boundary reduces complexity
+without regressing browser features.
 
 [webrtc-peerconnection]: https://w3c.github.io/webrtc-pc/#rtcpeerconnection-interface
 [webrtc-ice-candidate]: https://w3c.github.io/webrtc-pc/#rtcicecandidate-interface

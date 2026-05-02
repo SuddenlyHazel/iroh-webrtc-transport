@@ -7,7 +7,7 @@ static CONSOLE_TRACING: Once = Once::new();
 /// Install a browser console tracing subscriber for demo diagnostics.
 ///
 /// This writes tracing events directly to the JavaScript console. It does not
-/// send progress events or participate in browser worker control flow.
+/// send progress events or participate in browser runtime control flow.
 pub fn install_browser_console_tracing() {
     CONSOLE_TRACING.call_once(|| {
         use tracing_subscriber::prelude::*;
@@ -15,10 +15,6 @@ pub fn install_browser_console_tracing() {
         let subscriber = tracing_subscriber::registry().with(BrowserConsoleLayer);
         let _ = tracing::subscriber::set_global_default(subscriber);
     });
-}
-
-pub(crate) fn install_worker_console_tracing() {
-    install_browser_console_tracing();
 }
 
 struct BrowserConsoleLayer;

@@ -83,8 +83,8 @@ async fn native_facade_dials_and_accepts_ping_pong_over_webrtc() -> anyhow::Resu
 
 #[tokio::test]
 async fn native_webrtc_only_node_rejects_plain_iroh_application_dial() -> anyhow::Result<()> {
-    let server = native_node_with_options(SecretKey::generate(), WebRtcDialOptions::webrtc_only())
-        .await?;
+    let server =
+        native_node_with_options(SecretKey::generate(), WebRtcDialOptions::webrtc_only()).await?;
     let client = Endpoint::builder(presets::N0)
         .relay_mode(RelayMode::Disabled)
         .bind()

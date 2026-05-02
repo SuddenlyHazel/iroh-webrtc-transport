@@ -1,7 +1,7 @@
 //! Target-neutral application facade contracts.
 //!
 //! These types describe the Rust-owned app facade shape without tying callers
-//! to browser worker internals, Wasm bindings, or the native WebRTC backend.
+//! to browser runtime internals, Wasm bindings, or the native WebRTC backend.
 
 mod config;
 mod dial;

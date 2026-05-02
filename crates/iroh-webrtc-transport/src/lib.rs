@@ -10,7 +10,7 @@
 //! Most code should import one of the grouped public modules:
 //!
 //! - [`config`]: STUN, frame, and queue tuning.
-//! - [`browser`]: browser Wasm node facade and worker helpers.
+//! - [`browser`]: browser Wasm node facade.
 //! - [`native`]: native/server WebRTC session backend.
 //! - [`transport`]: Iroh custom transport integration.
 //! - [`facade`]: target-neutral facade configuration and dial options.
@@ -38,44 +38,23 @@
 //!
 //! # Browser shape
 //!
-//! Browser applications should use the browser `BrowserWebRtcNode` facade. The facade
-//! keeps Iroh/Wasm access serialized in a worker while the crate's internal
-//! main-thread bridge owns `RTCPeerConnection`, SDP, ICE, and
-//! `RTCDataChannel` creation. A dedicated `MessagePort` carries RTC control
-//! messages between the main thread and the worker, and the resulting
-//! `RTCDataChannel` is transferred to the worker before packet I/O starts.
+//! Browser applications should use the browser `BrowserWebRtcNode` facade. The
+//! facade owns Iroh/Wasm endpoint state and browser WebRTC objects in the same
+//! main-thread runtime.
 
 pub mod browser;
 #[cfg(all(
-    any(feature = "browser-main-thread", feature = "browser-worker"),
+    feature = "browser-main-thread",
     target_family = "wasm",
     target_os = "unknown"
 ))]
 mod browser_console_tracing;
-#[doc(hidden)]
-#[cfg(any(
-    test,
-    all(
-        feature = "browser-main-thread",
-        target_family = "wasm",
-        target_os = "unknown"
-    ),
-    all(
-        feature = "browser-worker",
-        target_family = "wasm",
-        target_os = "unknown"
-    )
+#[cfg(all(
+    feature = "browser-main-thread",
+    target_family = "wasm",
+    target_os = "unknown"
 ))]
-pub mod browser_protocol;
-#[cfg(any(
-    test,
-    all(
-        feature = "browser-worker",
-        target_family = "wasm",
-        target_os = "unknown"
-    )
-))]
-mod browser_worker;
+mod browser_runtime;
 pub mod config;
 mod core;
 /// Error and result types used by the transport, facades, and session helpers.
@@ -96,73 +75,15 @@ pub use error::{Error, Result};
 pub use facade::NativeWebRtcIrohNode;
 pub use facade::{WebRtcDialOptions, WebRtcNodeConfig};
 
-/// Export a browser worker entry point from an application Wasm module.
-///
-/// Browser Rust applications can use this macro to ship one Wasm module that
-/// contains both their main-thread app entry point and the Iroh WebRTC worker
-/// entry point.
+/// Export a browser application entry point from an application Wasm module.
 #[macro_export]
 macro_rules! browser_app {
     (
-        app = $app_entry:ident => $app_impl:path;
-        worker = $worker_entry:ident => {
-            protocols = [$($protocol:expr),* $(,)?] $(,)?
-        } $(;)?
+        app = $app_entry:ident => $app_impl:path $(;)?
     ) => {
         #[::wasm_bindgen::prelude::wasm_bindgen]
         pub async fn $app_entry() -> ::std::result::Result<(), ::wasm_bindgen::JsValue> {
             $app_impl().await
-        }
-
-        $crate::browser_app! {
-            worker = $worker_entry => {
-                protocols = [$($protocol),*]
-            };
-        }
-    };
-    (
-        app = $app_entry:ident => $app_impl:path;
-        worker = $worker_entry:ident $(;)?
-    ) => {
-        #[::wasm_bindgen::prelude::wasm_bindgen]
-        pub async fn $app_entry() -> ::std::result::Result<(), ::wasm_bindgen::JsValue> {
-            $app_impl().await
-        }
-
-        $crate::browser_app! {
-            worker = $worker_entry;
-        }
-    };
-    (
-        worker = $worker_entry:ident => {
-            protocols = [$($protocol:expr),* $(,)?] $(,)?
-        } $(;)?
-    ) => {
-        #[::wasm_bindgen::prelude::wasm_bindgen]
-        pub fn $worker_entry() -> ::std::result::Result<(), ::wasm_bindgen::JsValue> {
-            let mut registry = $crate::browser::BrowserWorkerProtocolRegistry::new();
-            $(
-                registry
-                    .register($protocol)
-                    .map_err(|err| ::wasm_bindgen::JsValue::from_str(&err))?;
-            )*
-            $crate::browser::start_browser_worker_with_protocols(registry)
-        }
-
-        #[::wasm_bindgen::prelude::wasm_bindgen(js_name = __iroh_webrtc_wasm_module)]
-        pub fn __iroh_webrtc_wasm_module() -> ::wasm_bindgen::JsValue {
-            ::wasm_bindgen::module()
-        }
-    };
-    (worker = $worker_entry:ident $(;)?) => {
-        #[::wasm_bindgen::prelude::wasm_bindgen]
-        pub fn $worker_entry() -> ::std::result::Result<(), ::wasm_bindgen::JsValue> {
-            $crate::browser::start_browser_worker()
-        }
-
-        #[::wasm_bindgen::prelude::wasm_bindgen(js_name = __iroh_webrtc_wasm_module)]
-        pub fn __iroh_webrtc_wasm_module() -> ::wasm_bindgen::JsValue {
-            ::wasm_bindgen::module()
         }
     };
 }

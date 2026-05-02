@@ -2,8 +2,8 @@ use std::future::Future;
 
 use serde::{Serialize, de::DeserializeOwned};
 
-/// Typed worker-owned browser protocol contract.
-pub trait BrowserWorkerProtocol: Clone + std::fmt::Debug + Send + Sync + 'static {
+/// Typed browser-owned protocol contract.
+pub trait BrowserProtocol: Clone + std::fmt::Debug + Send + Sync + 'static {
     const ALPN: &'static [u8];
 
     type Command: Serialize + DeserializeOwned + 'static;

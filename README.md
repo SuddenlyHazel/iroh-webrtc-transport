@@ -10,11 +10,10 @@ Iroh + WebRTC = Even More Weird Web Stuff
 
 ## Ahh, opinions?
 
-Just one really: Secret material must live in a web worker and not remain inside the main browser thread.
-
-What this means in practice is that there is a pretty large RPC protocol to facilitate communication between the main application code and the worker thread.
-
-Ideally, everything could just live inside the worker thread. Unfortunately, this is not possible today because the browser does not expose a bunch of APIs inside the worker context.
+The current experimental branch intentionally drops the browser worker split.
+Secret material, Iroh endpoint/session state, WebRTC negotiation, and
+DataChannel packet I/O all live in the browser main-thread Wasm runtime so the
+implementation can test whether removing the RPC boundary is simpler overall.
 
 ## So what do you get for free?
 
@@ -25,4 +24,3 @@ The goal is that application code should not need to know much about WebRTC cere
 - Endpoints, ALPNs, connections, and streams; it's still "just Iroh."
 
 I tried my hardest to have the crate bury all the WebRTC setup and Iroh custom transport glue.
-

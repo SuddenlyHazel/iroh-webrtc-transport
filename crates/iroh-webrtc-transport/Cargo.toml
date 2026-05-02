@@ -14,10 +14,9 @@ documentation = "https://docs.rs/iroh-webrtc-transport"
 crate-type = ["cdylib", "rlib"]
 
 [features]
-default = ["browser-main-thread", "native"]
-browser = ["browser-main-thread", "browser-worker"]
+default = ["browser", "native"]
+browser = ["browser-main-thread"]
 browser-main-thread = ["dep:js-sys", "dep:serde-wasm-bindgen", "dep:tracing-subscriber", "dep:wasm-bindgen", "dep:wasm-bindgen-futures", "dep:web-sys"]
-browser-worker = ["dep:js-sys", "dep:serde-wasm-bindgen", "dep:tracing-subscriber", "dep:wasm-bindgen", "dep:wasm-bindgen-futures", "dep:web-sys"]
 native = ["dep:webrtc"]
 
 [dependencies]
@@ -61,7 +60,6 @@ features = [
   "Event",
   "EventTarget",
   "MessageEvent",
-  "MessagePort",
   "RtcConfiguration",
   "RtcDataChannel",
   "RtcDataChannelEvent",
@@ -74,7 +72,4 @@ features = [
   "RtcPeerConnectionIceEvent",
   "RtcSdpType",
   "RtcSessionDescriptionInit",
-  "Worker",
-  "WorkerOptions",
-  "WorkerType",
 ]
