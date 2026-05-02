@@ -13,7 +13,7 @@ The goal is that application code should not need to know much about WebRTC cere
 
 - Browser Wasm facade that exposes Iroh-style endpoint IDs, dial, accept, and stream APIs
 - WebRTC channel bootstrapping with signaling using Iroh's relays
-- Native WebRTC implementation so browser clients can connect directly to native clients
+- Native WebRTC implementation so browser clients can connect directly to native clients and vice versa.
 - Endpoints, ALPNs, connections, and streams; it's still "just Iroh."
 
 I tried my hardest to have the crate bury all the WebRTC setup and Iroh custom transport glue.
