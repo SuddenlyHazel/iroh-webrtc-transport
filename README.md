@@ -6,18 +6,6 @@ Iroh + WebRTC = Even More Weird Web Stuff
 
 1. This is still very much experimental
 2. The API surface may still change as the transport model settles
-3. This isn't "generic." I've laid a lot of my own opinions in here.
-
-## Ahh, opinions?
-
-The browser runtime is direct main-thread Wasm now. There is no browser worker
-runtime, worker command bridge, `MessagePort` control channel, or DataChannel
-transfer between threads.
-
-Secret material, Iroh endpoint/session state, WebRTC negotiation, application
-protocol handlers, streams, benchmark helpers, and DataChannel packet I/O all
-live behind the browser facade in one runtime. That is the architecture this
-crate is carrying forward.
 
 ## So what do you get for free?
 
