@@ -7,15 +7,13 @@ use wasm_bindgen_futures::spawn_local;
 use web_sys::{Document, Element, HtmlButtonElement, HtmlInputElement, HtmlPreElement};
 
 const ALPN: &[u8] = b"example/iroh-webrtc-rust-browser-ping-pong/1";
-const WORKER_BENCHMARK_ALPN: &[u8] =
-    b"example/iroh-webrtc-rust-browser-ping-pong/worker-benchmark/1";
-const LATENCY_WARMUP_SAMPLES: usize = 3;
+const BENCHMARK_ALPN: &[u8] = b"example/iroh-webrtc-rust-browser-ping-pong/benchmark/1";
+const LATENCY_WARMUP_SAMPLES: usize = 16;
 const THROUGHPUT_WARMUP_BYTES: usize = 256 * 1024;
 const MAX_BENCHMARK_FRAME_BYTES: usize = 128 * 1024 * 1024;
 
 iroh_webrtc_transport::browser_app! {
     app = start_app => run_app;
-    worker = start_iroh_webrtc_worker;
 }
 
 async fn run_app() -> Result<(), JsValue> {
@@ -39,13 +37,13 @@ async fn run_app() -> Result<(), JsValue> {
         BrowserWebRtcNodeConfig::default().with_low_latency_quic_acks(low_latency_quic_acks),
     )
     .accept_facade(ALPN)
-    .accept_worker_latency_echo(WORKER_BENCHMARK_ALPN)
+    .accept_latency_echo(BENCHMARK_ALPN)
     .spawn()
     .await?;
     let endpoint_id = node.endpoint_id().to_string();
     local.set_value(&endpoint_id);
     render_endpoint_qr(&local_qr, &endpoint_id)?;
-    node.open_worker_latency_echo(WORKER_BENCHMARK_ALPN).await?;
+    node.open_latency_echo(BENCHMARK_ALPN).await?;
     log_line(&log, &format!("local endpoint: {endpoint_id}"));
     log_line(
         &log,
@@ -98,7 +96,7 @@ async fn run_app() -> Result<(), JsValue> {
         let buttons = latency_buttons.clone();
         set_buttons_disabled(&buttons, true);
         spawn_local(async move {
-            if let Err(error) = check_worker_latency(node, remote, samples, log.clone()).await {
+            if let Err(error) = check_latency(node, remote, samples, log.clone()).await {
                 log_line(&log, &format!("latency error: {error:?}"));
             }
             set_buttons_disabled(&buttons, false);
@@ -231,7 +229,7 @@ async fn request_ping(
     request_response(connection, b"ping").await
 }
 
-async fn check_worker_latency(
+async fn check_latency(
     node: BrowserWebRtcNode,
     remote: String,
     samples: usize,
@@ -245,15 +243,10 @@ async fn check_worker_latency(
 
     log_line(
         &log,
-        &format!("worker latency check: {samples} samples to {remote}"),
+        &format!("latency check: {samples} samples to {remote}"),
     );
     let stats = node
-        .check_worker_latency(
-            remote,
-            WORKER_BENCHMARK_ALPN,
-            samples,
-            LATENCY_WARMUP_SAMPLES,
-        )
+        .check_latency(remote, BENCHMARK_ALPN, samples, LATENCY_WARMUP_SAMPLES)
         .await?;
     log_line(
         &log,
@@ -312,12 +305,7 @@ async fn check_throughput(
         &format!("throughput check: {} to {remote}", format_mib(bytes)),
     );
     let stats = node
-        .check_worker_throughput(
-            remote,
-            WORKER_BENCHMARK_ALPN,
-            bytes,
-            THROUGHPUT_WARMUP_BYTES,
-        )
+        .check_throughput(remote, BENCHMARK_ALPN, bytes, THROUGHPUT_WARMUP_BYTES)
         .await?;
     log_line(
         &log,

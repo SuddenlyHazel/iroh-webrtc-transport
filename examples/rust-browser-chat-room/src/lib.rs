@@ -16,8 +16,8 @@ use iroh_gossip::{
 use iroh_webrtc_transport::{
     Error, Result,
     browser::{
-        BrowserDialTransportPreference, BrowserProtocolHandle, BrowserWebRtcNode,
-        BrowserWebRtcNodeConfig, BrowserWorkerProtocol,
+        BrowserDialTransportPreference, BrowserProtocol, BrowserProtocolHandle, BrowserWebRtcNode,
+        BrowserWebRtcNodeConfig,
     },
 };
 use n0_future::{StreamExt, task};
@@ -34,9 +34,6 @@ const CHAT_TOPIC_BYTES: [u8; 32] = [0x42; 32];
 
 iroh_webrtc_transport::browser_app! {
     app = start_app => run_app;
-    worker = start_iroh_webrtc_worker => {
-        protocols = [ChatGossipProtocol::default()]
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -112,7 +109,7 @@ impl Default for ChatGossipProtocol {
     }
 }
 
-impl BrowserWorkerProtocol for ChatGossipProtocol {
+impl BrowserProtocol for ChatGossipProtocol {
     const ALPN: &'static [u8] = GOSSIP_ALPN;
 
     type Command = ChatGossipCommand;
@@ -338,10 +335,12 @@ async fn run_app() -> std::result::Result<(), JsValue> {
     let local = element::<HtmlInputElement>(&document, "local")?;
     let node = BrowserWebRtcNode::builder(
         BrowserWebRtcNodeConfig::default()
-            .with_worker_protocol_transport_preference(BrowserDialTransportPreference::WebRtcOnly),
+            .with_protocol_transport_preference(BrowserDialTransportPreference::WebRtcOnly),
     )
-        .spawn()
-        .await?;
+    .protocol(ChatGossipProtocol::default())
+    .map_err(|err| JsValue::from_str(&err))?
+    .spawn()
+    .await?;
     let gossip = node.protocol::<ChatGossipProtocol>().await?;
     let local_endpoint = node.endpoint_id().to_owned();
     let topic = TopicId::from_bytes(CHAT_TOPIC_BYTES).to_string();
@@ -578,7 +577,7 @@ async fn send_current_message(state: Rc<RefCell<AppState>>) -> std::result::Resu
             topic,
             from_endpoint,
             from_name,
-            text,
+            text: text.to_string(),
         })
         .await?;
     {

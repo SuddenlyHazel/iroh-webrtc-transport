@@ -1,6 +1,6 @@
-use super::{js_wire::*, *};
+use super::{js_boundary::*, *};
 use crate::error::{Error, Result};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 
 pub(super) fn ice_config_from_js(stun_urls: Option<Vec<String>>) -> Result<WebRtcIceConfig> {
     let Some(stun_urls) = stun_urls else {
@@ -86,26 +86,6 @@ pub(super) async fn add_end_of_candidates_for_peer(peer: &RtcPeerConnection) -> 
     Ok(())
 }
 
-pub(super) fn local_ice_to_js(event: LocalIceEvent) -> Result<JsValue> {
-    serde_wasm_bindgen::to_value(&MainRtcIcePayload::from(event))
-        .map_err(|err| Error::WebRtc(format!("failed to encode local ICE payload: {err}")))
-}
-
-pub(super) fn local_ice_from_payload(payload: MainRtcIcePayload) -> LocalIceEvent {
-    match payload {
-        MainRtcIcePayload::Candidate {
-            candidate,
-            sdp_mid,
-            sdp_mline_index,
-        } => LocalIceEvent::Candidate(WebRtcIceCandidate {
-            candidate,
-            sdp_mid,
-            sdp_mline_index,
-        }),
-        MainRtcIcePayload::EndOfCandidates => LocalIceEvent::EndOfCandidates,
-    }
-}
-
 pub(super) fn apply_ice_config(
     configuration: &RtcConfiguration,
     ice_config: &WebRtcIceConfig,
@@ -124,30 +104,4 @@ pub(super) fn apply_ice_config(
     }
     configuration.set_ice_servers(&servers);
     Ok(())
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "type")]
-pub(super) enum MainRtcIcePayload {
-    #[serde(rename = "candidate", rename_all = "camelCase")]
-    Candidate {
-        candidate: String,
-        sdp_mid: Option<String>,
-        sdp_mline_index: Option<u16>,
-    },
-    #[serde(rename = "endOfCandidates")]
-    EndOfCandidates,
-}
-
-impl From<LocalIceEvent> for MainRtcIcePayload {
-    fn from(value: LocalIceEvent) -> Self {
-        match value {
-            LocalIceEvent::Candidate(candidate) => Self::Candidate {
-                candidate: candidate.candidate,
-                sdp_mid: candidate.sdp_mid,
-                sdp_mline_index: candidate.sdp_mline_index,
-            },
-            LocalIceEvent::EndOfCandidates => Self::EndOfCandidates,
-        }
-    }
 }

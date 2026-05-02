@@ -1,7 +1,7 @@
 //! Configuration types for the WebRTC custom transport.
 //!
 //! Start here when tuning how the Rust transport behaves. These types are
-//! shared by the browser worker and native/server entry points.
+//! shared by the browser runtime and native/server entry points.
 
 use crate::error::{Error, Result};
 pub use crate::transport::{WebRtcQueueConfig, WebRtcTransportConfig};

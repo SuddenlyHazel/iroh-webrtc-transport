@@ -2,8 +2,8 @@
 """Serve a plain, non-Trunk HTML smoke page from the current build.
 
 Run `trunk build` first. This script writes `dist/plain-python-smoke.html`
-that imports the generated wasm-bindgen module directly, installs the explicit
-single-Wasm worker factory, and then calls the exported app entry point.
+that imports the generated wasm-bindgen module directly and calls the exported
+app entry point.
 """
 
 from __future__ import annotations

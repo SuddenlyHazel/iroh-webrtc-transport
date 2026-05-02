@@ -9,20 +9,6 @@
     <title>Iroh WebRTC Rust Browser Chat Room</title>
     <script>
       globalThis.addEventListener("TrunkApplicationStarted", () => {
-        const appModule = Array.from(
-          document.querySelectorAll('link[rel="modulepreload"][href$=".js"]'),
-        ).find((link) => !new URL(link.href, document.baseURI).pathname.includes("/snippets/"));
-        if (!appModule) {
-          throw new Error("missing Trunk app module asset");
-        }
-
-        globalThis.createIrohWebRtcWorker =
-          globalThis.wasmBindings.createIrohWebRtcWorkerFactoryForModule(
-            new URL(appModule.href, document.baseURI).href,
-            globalThis.wasmBindings.__iroh_webrtc_wasm_module(),
-            "start_iroh_webrtc_worker",
-          );
-
         globalThis.wasmBindings.start_app().catch((error) => {
           console.error("failed to start Iroh WebRTC chat room app", error);
         });
