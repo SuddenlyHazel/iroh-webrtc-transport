@@ -13,28 +13,23 @@ impl BrowserWorkerNode {
         if inner.closed {
             return Err(BrowserWorkerError::closed());
         }
-        if inner.accepts.contains_key(&alpn) {
+        let registration = inner.accepts.get_mut(&alpn).ok_or_else(|| {
+            BrowserWorkerError::new(
+                BrowserWorkerErrorCode::UnsupportedAlpn,
+                format!("ALPN {alpn:?} was not registered as a facade accept protocol"),
+            )
+        })?;
+        if registration.claimed {
             return Err(BrowserWorkerError::new(
                 BrowserWorkerErrorCode::UnsupportedAlpn,
                 format!("an accept iterator is already active for ALPN {alpn:?}"),
             ));
         }
-
-        let id = WorkerAcceptId(inner.next_accept_id);
-        inner.next_accept_id = inner
-            .next_accept_id
-            .checked_add(1)
-            .expect("worker accept id exhausted");
+        registration.claimed = true;
         let registration = WorkerAcceptRegistration {
-            id,
+            id: registration.id,
             alpn: alpn.clone(),
         };
-        let capacity = inner.accept_queue_capacity;
-        inner.accepts.insert(
-            alpn.clone(),
-            AcceptRegistrationState::new(id, alpn, capacity),
-        );
-        inner.refresh_endpoint_alpns();
         Ok(registration)
     }
 
@@ -122,19 +117,32 @@ impl BrowserWorkerNode {
         let Some(alpn) = inner.accept_alpn_for_id(accept_id) else {
             return Ok(false);
         };
-        if let Some(registration) = inner.accepts.remove(&alpn) {
-            registration.complete_waiters_done();
+        if let Some(registration) = inner.accepts.get_mut(&alpn) {
+            registration.close_acceptor();
         }
-        inner.refresh_endpoint_alpns();
         Ok(true)
     }
 
+    #[cfg(test)]
     pub(in crate::browser_worker) fn is_alpn_registered(&self, alpn: &str) -> bool {
         self.inner
             .lock()
             .expect("browser worker node mutex poisoned")
             .accepts
             .contains_key(alpn)
+    }
+
+    pub(in crate::browser_worker) fn is_application_alpn_registered(&self, alpn: &str) -> bool {
+        let inner = self
+            .inner
+            .lock()
+            .expect("browser worker node mutex poisoned");
+        inner.accepts.contains_key(alpn)
+            || inner
+                .benchmark_echo_alpns
+                .iter()
+                .any(|registered| registered == alpn)
+            || inner.worker_protocols.contains_alpn(alpn)
     }
 
     #[cfg(test)]
@@ -235,55 +243,6 @@ impl BrowserWorkerNode {
             .clone()
     }
 
-    pub(super) fn incoming_application_route(
-        &self,
-        remote: EndpointId,
-        alpn: &str,
-    ) -> (WorkerResolvedTransport, Option<WorkerSessionKey>) {
-        let inner = self
-            .inner
-            .lock()
-            .expect("browser worker node mutex poisoned");
-        let session_key = inner
-            .sessions
-            .values()
-            .find(|session| {
-                session.role == WorkerSessionRole::Acceptor
-                    && session.remote == remote
-                    && session.alpn == alpn
-                    && session.transport_intent.uses_webrtc()
-                    && session.resolved_transport.is_none()
-                    && session.channel_attachment == WorkerDataChannelAttachmentState::Open
-                    && matches!(
-                        session.lifecycle,
-                        WorkerSessionLifecycle::WebRtcNegotiating
-                            | WorkerSessionLifecycle::ApplicationReady
-                    )
-            })
-            .map(|session| session.session_key.clone());
-        match session_key {
-            Some(session_key) => {
-                tracing::trace!(
-                    target: "iroh_webrtc_transport::browser_worker::connection",
-                    remote = %remote,
-                    alpn = %alpn,
-                    session_key = %session_key.as_str(),
-                    "matched incoming application connection to WebRTC session"
-                );
-                (WorkerResolvedTransport::WebRtc, Some(session_key))
-            }
-            None => {
-                tracing::trace!(
-                    target: "iroh_webrtc_transport::browser_worker::connection",
-                    remote = %remote,
-                    alpn = %alpn,
-                    "routing incoming application connection as Iroh relay"
-                );
-                (WorkerResolvedTransport::IrohRelay, None)
-            }
-        }
-    }
-
     pub(super) fn admit_iroh_application_connection(
         &self,
         iroh_connection: Connection,
@@ -291,6 +250,22 @@ impl BrowserWorkerNode {
         session_key: Option<WorkerSessionKey>,
         queue_accept: bool,
     ) -> BrowserWorkerResult<WorkerProtocolConnectionInfo> {
+        self.admit_iroh_application_connection_with_key(
+            iroh_connection,
+            transport,
+            session_key,
+            queue_accept,
+        )
+        .map(|(_, info)| info)
+    }
+
+    pub(super) fn admit_iroh_application_connection_with_key(
+        &self,
+        iroh_connection: Connection,
+        transport: WorkerResolvedTransport,
+        session_key: Option<WorkerSessionKey>,
+        queue_accept: bool,
+    ) -> BrowserWorkerResult<(WorkerConnectionKey, WorkerProtocolConnectionInfo)> {
         let remote = iroh_connection.remote_id();
         let alpn = String::from_utf8_lossy(iroh_connection.alpn()).to_string();
         trace_iroh_connection_paths(
@@ -384,7 +359,7 @@ impl BrowserWorkerNode {
                 connection,
             );
         }
-        Ok(info)
+        Ok((key, info))
     }
 
     pub(super) fn iroh_connection(

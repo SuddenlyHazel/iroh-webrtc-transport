@@ -81,17 +81,54 @@ async fn native_facade_dials_and_accepts_ping_pong_over_webrtc() -> anyhow::Resu
     Ok(())
 }
 
-async fn native_node(secret_key: SecretKey) -> anyhow::Result<NativeWebRtcIrohNode> {
-    let config = WebRtcNodeConfig {
-        session: WebRtcSessionConfig::no_ice_servers(),
-        ..WebRtcNodeConfig::default()
-    };
-    NativeWebRtcIrohNode::bind_with_builder(
-        config,
-        secret_key.clone(),
-        Endpoint::builder(presets::N0).relay_mode(RelayMode::Disabled),
+#[tokio::test]
+async fn native_webrtc_only_node_rejects_plain_iroh_application_dial() -> anyhow::Result<()> {
+    let server = native_node_with_options(SecretKey::generate(), WebRtcDialOptions::webrtc_only())
+        .await?;
+    let client = Endpoint::builder(presets::N0)
+        .relay_mode(RelayMode::Disabled)
+        .bind()
+        .await?;
+    let server_addr = endpoint_addr(&server).await?;
+
+    let error = timeout(
+        "plain Iroh application dial should fail",
+        client.connect(server_addr, ALPN),
     )
     .await
+    .expect_err("plain Iroh dial unexpectedly reached WebRTC-only native app ALPN");
+
+    assert!(
+        error.to_string().contains("ALPN")
+            || error.to_string().contains("closed")
+            || error.to_string().contains("application")
+            || error.to_string().contains("protocol"),
+        "unexpected plain Iroh dial error: {error:#}"
+    );
+
+    client.close().await;
+    server.close().await;
+    Ok(())
+}
+
+async fn native_node(secret_key: SecretKey) -> anyhow::Result<NativeWebRtcIrohNode> {
+    native_node_with_options(secret_key, WebRtcDialOptions::default()).await
+}
+
+async fn native_node_with_options(
+    secret_key: SecretKey,
+    default_dial_options: WebRtcDialOptions,
+) -> anyhow::Result<NativeWebRtcIrohNode> {
+    let config = WebRtcNodeConfig {
+        session: WebRtcSessionConfig::no_ice_servers(),
+        default_dial_options,
+        ..WebRtcNodeConfig::default()
+    };
+    NativeWebRtcIrohNode::builder(config, secret_key.clone())
+        .endpoint_builder(Endpoint::builder(presets::N0).relay_mode(RelayMode::Disabled))
+        .accept_facade(ALPN)
+        .spawn()
+        .await
 }
 
 async fn endpoint_addr(node: &NativeWebRtcIrohNode) -> anyhow::Result<EndpointAddr> {

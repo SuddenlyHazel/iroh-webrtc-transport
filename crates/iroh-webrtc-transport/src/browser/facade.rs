@@ -2,11 +2,14 @@ use std::{fmt, rc::Rc};
 
 use super::{registry::WebRtcMainThreadRegistry, worker_bridge::WebRtcMainThreadWorkerBridge};
 use crate::{
+    browser::BrowserWorkerProtocol,
     browser::{
         BENCHMARK_ECHO_OPEN_COMMAND, BENCHMARK_LATENCY_COMMAND, BENCHMARK_THROUGHPUT_COMMAND,
-        STREAM_SEND_CHUNK_COMMAND,
+        STREAM_SEND_CHUNK_COMMAND, WORKER_PROTOCOL_COMMAND_COMMAND,
+        WORKER_PROTOCOL_NEXT_EVENT_COMMAND,
         js_wire::{js_array_buffer_like_to_vec, js_context_error, set_js_value},
     },
+    browser_protocol::{decode_js_value, encode_js_value},
     config::WebRtcIceConfig,
 };
 use serde::{Deserialize, Serialize};
@@ -15,6 +18,24 @@ use wasm_bindgen_futures::JsFuture;
 use web_sys::{Worker, WorkerOptions, WorkerType};
 
 const DEFAULT_WORKER_FACTORY_GLOBAL: &str = "createIrohWebRtcWorker";
+
+/// Preferred transport behavior for browser dials.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BrowserDialTransportPreference {
+    IrohRelay,
+    WebRtcPreferred,
+    WebRtcOnly,
+}
+
+impl BrowserDialTransportPreference {
+    fn as_wire_value(self) -> &'static str {
+        match self {
+            Self::IrohRelay => "irohRelay",
+            Self::WebRtcPreferred => "webrtcPreferred",
+            Self::WebRtcOnly => "webrtcOnly",
+        }
+    }
+}
 
 /// Browser app facade configuration.
 #[derive(Clone)]
@@ -29,6 +50,8 @@ pub struct BrowserWebRtcNodeConfig {
     pub stun_urls: Vec<String>,
     /// Request low-latency QUIC ACK behavior for browser WebRTC-backed Iroh endpoints.
     pub low_latency_quic_acks: bool,
+    /// Transport policy applied to worker-owned protocols that call `Endpoint::connect` directly.
+    pub worker_protocol_transport_preference: BrowserDialTransportPreference,
 }
 
 impl Default for BrowserWebRtcNodeConfig {
@@ -38,6 +61,7 @@ impl Default for BrowserWebRtcNodeConfig {
             worker_factory: None,
             stun_urls: WebRtcIceConfig::default_direct_stun().stun_urls,
             low_latency_quic_acks: false,
+            worker_protocol_transport_preference: BrowserDialTransportPreference::WebRtcPreferred,
         }
     }
 }
@@ -49,6 +73,10 @@ impl fmt::Debug for BrowserWebRtcNodeConfig {
             .field("worker_factory", &self.worker_factory.is_some())
             .field("stun_urls", &self.stun_urls)
             .field("low_latency_quic_acks", &self.low_latency_quic_acks)
+            .field(
+                "worker_protocol_transport_preference",
+                &self.worker_protocol_transport_preference,
+            )
             .finish()
     }
 }
@@ -59,6 +87,8 @@ impl PartialEq for BrowserWebRtcNodeConfig {
             && worker_factory_eq(&self.worker_factory, &other.worker_factory)
             && self.stun_urls == other.stun_urls
             && self.low_latency_quic_acks == other.low_latency_quic_acks
+            && self.worker_protocol_transport_preference
+                == other.worker_protocol_transport_preference
     }
 }
 
@@ -80,23 +110,13 @@ impl BrowserWebRtcNodeConfig {
         self.low_latency_quic_acks = enabled;
         self
     }
-}
 
-/// Preferred transport behavior for browser dials.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BrowserDialTransportPreference {
-    IrohRelay,
-    WebRtcPreferred,
-    WebRtcOnly,
-}
-
-impl BrowserDialTransportPreference {
-    fn as_wire_value(self) -> &'static str {
-        match self {
-            Self::IrohRelay => "irohRelay",
-            Self::WebRtcPreferred => "webrtcPreferred",
-            Self::WebRtcOnly => "webrtcOnly",
-        }
+    pub fn with_worker_protocol_transport_preference(
+        mut self,
+        preference: BrowserDialTransportPreference,
+    ) -> Self {
+        self.worker_protocol_transport_preference = preference;
+        self
     }
 }
 
@@ -149,6 +169,12 @@ pub struct BrowserWorkerThroughputStats {
     pub bytes: usize,
     pub upload_ms: f64,
     pub download_ms: f64,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkerProtocolEventPayload {
+    alpn: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -217,6 +243,9 @@ struct WorkerSpawnPayload {
     stun_urls: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     low_latency_quic_acks: Option<bool>,
+    worker_protocol_transport_intent: String,
+    facade_alpns: Vec<String>,
+    benchmark_echo_alpns: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -301,23 +330,55 @@ struct BrowserWebRtcNodeInner {
     bridge: WebRtcMainThreadWorkerBridge,
 }
 
-impl BrowserWebRtcNode {
-    pub async fn spawn(config: BrowserWebRtcNodeConfig) -> Result<Self, JsValue> {
-        let worker = create_worker(&config)?;
+pub struct BrowserWebRtcNodeBuilder {
+    config: BrowserWebRtcNodeConfig,
+    facade_alpns: Vec<String>,
+    benchmark_echo_alpns: Vec<String>,
+}
+
+impl BrowserWebRtcNodeBuilder {
+    pub fn accept_facade(mut self, alpn: impl AsRef<[u8]>) -> Self {
+        self.facade_alpns
+            .push(String::from_utf8_lossy(alpn.as_ref()).into_owned());
+        self
+    }
+
+    pub fn accept_worker_latency_echo(mut self, alpn: impl AsRef<[u8]>) -> Self {
+        self.benchmark_echo_alpns
+            .push(String::from_utf8_lossy(alpn.as_ref()).into_owned());
+        self
+    }
+
+    pub async fn spawn(self) -> Result<BrowserWebRtcNode, JsValue> {
+        let worker = create_worker(&self.config)?;
         let registry = WebRtcMainThreadRegistry::new();
         let bridge = WebRtcMainThreadWorkerBridge::new(worker, &registry)?;
         bridge.attach_rtc_control_channel()?;
 
         let result: WorkerSpawnResult =
-            await_worker_result(bridge.spawn(spawn_payload(&config)?)?).await?;
+            await_worker_result(bridge.spawn(spawn_payload(&self)?)?).await?;
         let endpoint_id = result.endpoint_id;
 
-        Ok(Self {
+        Ok(BrowserWebRtcNode {
             inner: Rc::new(BrowserWebRtcNodeInner {
                 endpoint_id,
                 bridge,
             }),
         })
+    }
+}
+
+impl BrowserWebRtcNode {
+    pub fn builder(config: BrowserWebRtcNodeConfig) -> BrowserWebRtcNodeBuilder {
+        BrowserWebRtcNodeBuilder {
+            config,
+            facade_alpns: Vec::new(),
+            benchmark_echo_alpns: Vec::new(),
+        }
+    }
+
+    pub async fn spawn(config: BrowserWebRtcNodeConfig) -> Result<Self, JsValue> {
+        Self::builder(config).spawn().await
     }
 
     pub fn endpoint_id(&self) -> &str {
@@ -349,6 +410,16 @@ impl BrowserWebRtcNode {
             node: self.inner.clone(),
             accept_key: result.accept_key,
             closed: Rc::new(std::cell::Cell::new(false)),
+        })
+    }
+
+    pub async fn protocol<P>(&self) -> Result<BrowserProtocolHandle<P>, JsValue>
+    where
+        P: BrowserWorkerProtocol,
+    {
+        Ok(BrowserProtocolHandle {
+            node: self.inner.clone(),
+            _protocol: std::marker::PhantomData,
         })
     }
 
@@ -398,6 +469,41 @@ impl BrowserWebRtcNode {
         let _ = await_promise(self.inner.bridge.node_close(reason_payload(reason)?)?).await?;
         self.inner.bridge.close();
         Ok(())
+    }
+}
+
+#[derive(Clone)]
+pub struct BrowserProtocolHandle<P> {
+    node: Rc<BrowserWebRtcNodeInner>,
+    _protocol: std::marker::PhantomData<P>,
+}
+
+impl<P> BrowserProtocolHandle<P>
+where
+    P: BrowserWorkerProtocol,
+{
+    pub async fn send(&self, command: P::Command) -> Result<(), JsValue> {
+        let payload = protocol_command_payload(P::ALPN, &command)?;
+        let _ = await_promise(self.node.bridge.request(
+            WORKER_PROTOCOL_COMMAND_COMMAND.into(),
+            payload,
+            None,
+        )?)
+        .await?;
+        Ok(())
+    }
+
+    pub async fn next_event(&self) -> Result<Option<P::Event>, JsValue> {
+        let payload = WorkerProtocolEventPayload {
+            alpn: String::from_utf8_lossy(P::ALPN).into_owned(),
+        };
+        let value = await_promise(self.node.bridge.request(
+            WORKER_PROTOCOL_NEXT_EVENT_COMMAND.into(),
+            encode_payload(&payload)?,
+            None,
+        )?)
+        .await?;
+        decode_js_value(value)
     }
 }
 
@@ -633,10 +739,17 @@ fn worker_factory_eq(left: &Option<js_sys::Function>, right: &Option<js_sys::Fun
     }
 }
 
-fn spawn_payload(config: &BrowserWebRtcNodeConfig) -> Result<JsValue, JsValue> {
+fn spawn_payload(builder: &BrowserWebRtcNodeBuilder) -> Result<JsValue, JsValue> {
     encode_payload(&WorkerSpawnPayload {
-        stun_urls: config.stun_urls.clone(),
-        low_latency_quic_acks: config.low_latency_quic_acks.then_some(true),
+        stun_urls: builder.config.stun_urls.clone(),
+        low_latency_quic_acks: builder.config.low_latency_quic_acks.then_some(true),
+        worker_protocol_transport_intent: builder
+            .config
+            .worker_protocol_transport_preference
+            .as_wire_value()
+            .to_owned(),
+        facade_alpns: builder.facade_alpns.clone(),
+        benchmark_echo_alpns: builder.benchmark_echo_alpns.clone(),
     })
 }
 
@@ -733,6 +846,18 @@ fn stream_chunk_payload(stream_key: &str, chunk: js_sys::ArrayBuffer) -> Result<
         .dyn_into::<js_sys::Object>()
         .map_err(|_| JsValue::from_str("stream chunk payload must be an object"))?;
     set_js_value(&object, "chunk", chunk.into()).map_err(js_error)?;
+    Ok(object.into())
+}
+
+fn protocol_command_payload<T: Serialize>(alpn: &[u8], command: &T) -> Result<JsValue, JsValue> {
+    let object = js_sys::Object::new();
+    set_js_value(
+        &object,
+        "alpn",
+        JsValue::from_str(&String::from_utf8_lossy(alpn)),
+    )
+    .map_err(js_error)?;
+    set_js_value(&object, "command", encode_js_value(command)?).map_err(js_error)?;
     Ok(object.into())
 }
 

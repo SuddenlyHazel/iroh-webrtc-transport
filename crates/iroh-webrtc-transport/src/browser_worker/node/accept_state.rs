@@ -10,6 +10,7 @@ use crate::browser_worker::{
 pub(super) struct AcceptRegistrationState {
     pub(super) id: WorkerAcceptId,
     pub(super) alpn: String,
+    pub(super) claimed: bool,
     pub(super) queue: VecDeque<WorkerAcceptedConnection>,
     pub(super) waiters: VecDeque<oneshot::Sender<WorkerAcceptNext>>,
     capacity: usize,
@@ -20,6 +21,7 @@ impl AcceptRegistrationState {
         Self {
             id,
             alpn,
+            claimed: false,
             queue: VecDeque::new(),
             waiters: VecDeque::new(),
             capacity,
@@ -48,9 +50,15 @@ impl AcceptRegistrationState {
         Ok(())
     }
 
-    pub(super) fn complete_waiters_done(self) {
-        for waiter in self.waiters {
+    pub(super) fn close_acceptor(&mut self) {
+        self.claimed = false;
+        self.queue.clear();
+        for waiter in self.waiters.drain(..) {
             let _ = waiter.send(WorkerAcceptNext::Done);
         }
+    }
+
+    pub(super) fn complete_waiters_done(mut self) {
+        self.close_acceptor();
     }
 }

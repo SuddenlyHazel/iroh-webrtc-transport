@@ -9,6 +9,9 @@ use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::spawn_local;
 
 use super::dial::{PendingWorkerDial, complete_pending_dial_from_result};
+use super::protocol_transport::{
+    PendingProtocolTransportPrepare, complete_pending_protocol_transport_prepare_from_result,
+};
 use super::rtc_control::{WorkerRtcControlPort, dispatch_main_rtc_commands_from_result};
 use super::wire::wire_error_to_js;
 use super::*;
@@ -18,6 +21,8 @@ pub(super) struct WorkerBootstrapRuntime {
     connection_rx: RefCell<Option<mpsc::UnboundedReceiver<Connection>>>,
     pub(super) signal_senders: RefCell<HashMap<String, BootstrapSignalWriter>>,
     pub(super) pending_dials: RefCell<HashMap<String, PendingWorkerDial>>,
+    pub(super) pending_protocol_transport_prepares:
+        RefCell<HashMap<String, PendingProtocolTransportPrepare>>,
     accept_loop_started: Cell<bool>,
 }
 
@@ -38,6 +43,7 @@ impl WorkerBootstrapRuntime {
             connection_rx: RefCell::new(Some(connection_rx)),
             signal_senders: RefCell::new(HashMap::new()),
             pending_dials: RefCell::new(HashMap::new()),
+            pending_protocol_transport_prepares: RefCell::new(HashMap::new()),
             accept_loop_started: Cell::new(false),
         }
     }
@@ -141,6 +147,11 @@ fn spawn_bootstrap_receiver_loop_with_sender(
             };
             let _ = send_outbound_signals_from_result(&bootstrap, &result);
             let _ = complete_pending_dial_from_result(core.clone(), bootstrap.clone(), &result);
+            let _ = complete_pending_protocol_transport_prepare_from_result(
+                core.clone(),
+                bootstrap.clone(),
+                &result,
+            );
             let _ = dispatch_main_rtc_commands_from_result(
                 &core,
                 &rtc_control,

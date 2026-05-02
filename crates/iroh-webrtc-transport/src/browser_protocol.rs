@@ -46,9 +46,49 @@ pub(crate) use names::{
     )
 ))]
 pub(crate) use names::{WORKER_BOOTSTRAP_SIGNAL_COMMAND, WORKER_MAIN_RTC_RESULT_COMMAND};
+#[cfg(any(
+    test,
+    all(
+        feature = "browser-main-thread",
+        target_family = "wasm",
+        target_os = "unknown"
+    ),
+    all(
+        feature = "browser-worker",
+        target_family = "wasm",
+        target_os = "unknown"
+    )
+))]
+pub(crate) use names::{WORKER_PROTOCOL_COMMAND_COMMAND, WORKER_PROTOCOL_NEXT_EVENT_COMMAND};
 #[cfg(all(
     feature = "browser-worker",
     target_family = "wasm",
     target_os = "unknown"
 ))]
 pub(crate) use transfers::response_transfer_requirements_for_command;
+
+#[cfg(all(
+    feature = "browser-main-thread",
+    target_family = "wasm",
+    target_os = "unknown"
+))]
+pub(crate) fn encode_js_value<T: serde::Serialize>(
+    value: &T,
+) -> std::result::Result<wasm_bindgen::JsValue, wasm_bindgen::JsValue> {
+    serde_wasm_bindgen::to_value(value).map_err(|err| {
+        wasm_bindgen::JsValue::from_str(&format!("failed to encode browser protocol value: {err}"))
+    })
+}
+
+#[cfg(all(
+    feature = "browser-main-thread",
+    target_family = "wasm",
+    target_os = "unknown"
+))]
+pub(crate) fn decode_js_value<T: serde::de::DeserializeOwned>(
+    value: wasm_bindgen::JsValue,
+) -> std::result::Result<T, wasm_bindgen::JsValue> {
+    serde_wasm_bindgen::from_value(value).map_err(|err| {
+        wasm_bindgen::JsValue::from_str(&format!("failed to decode browser protocol value: {err}"))
+    })
+}

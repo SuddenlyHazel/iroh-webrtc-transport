@@ -34,7 +34,8 @@ use crate::browser_protocol::{
     STREAM_OPEN_BI_COMMAND, STREAM_RECEIVE_CHUNK_COMMAND, STREAM_SEND_CHUNK_COMMAND,
     WORKER_ACCEPT_CLOSE_COMMAND, WORKER_ACCEPT_NEXT_COMMAND, WORKER_ACCEPT_OPEN_COMMAND,
     WORKER_ATTACH_DATA_CHANNEL_COMMAND, WORKER_CONNECTION_CLOSE_COMMAND, WORKER_DIAL_COMMAND,
-    WORKER_NODE_CLOSE_COMMAND, WORKER_SPAWN_COMMAND,
+    WORKER_NODE_CLOSE_COMMAND, WORKER_PROTOCOL_COMMAND_COMMAND, WORKER_PROTOCOL_NEXT_EVENT_COMMAND,
+    WORKER_SPAWN_COMMAND,
 };
 #[cfg(all(test, not(all(target_family = "wasm", target_os = "unknown"))))]
 use crate::browser_protocol::{
@@ -99,6 +100,21 @@ mod js_wire;
 ))]
 mod facade;
 
+#[cfg(any(
+    test,
+    all(
+        feature = "browser-main-thread",
+        target_family = "wasm",
+        target_os = "unknown"
+    ),
+    all(
+        feature = "browser-worker",
+        target_family = "wasm",
+        target_os = "unknown"
+    )
+))]
+mod protocol;
+
 #[cfg(all(
     feature = "browser-main-thread",
     target_family = "wasm",
@@ -148,16 +164,33 @@ pub use crate::browser_console_tracing::install_browser_console_tracing;
     target_family = "wasm",
     target_os = "unknown"
 ))]
-pub use crate::browser_worker::start_browser_worker;
+pub use crate::browser_worker::{
+    BrowserWorkerProtocolRegistry, start_browser_worker, start_browser_worker_with_protocols,
+};
 #[cfg(all(
     feature = "browser-main-thread",
     target_family = "wasm",
     target_os = "unknown"
 ))]
 pub use facade::{
-    BrowserDialOptions, BrowserDialTransportPreference, BrowserWebRtcAcceptor,
-    BrowserWebRtcConnection, BrowserWebRtcNode, BrowserWebRtcNodeConfig, BrowserWebRtcStream,
+    BrowserDialOptions, BrowserDialTransportPreference, BrowserProtocolHandle,
+    BrowserWebRtcAcceptor, BrowserWebRtcConnection, BrowserWebRtcNode, BrowserWebRtcNodeBuilder,
+    BrowserWebRtcNodeConfig, BrowserWebRtcStream,
 };
+#[cfg(any(
+    test,
+    all(
+        feature = "browser-main-thread",
+        target_family = "wasm",
+        target_os = "unknown"
+    ),
+    all(
+        feature = "browser-worker",
+        target_family = "wasm",
+        target_os = "unknown"
+    )
+))]
+pub use protocol::BrowserWorkerProtocol;
 #[cfg(all(
     feature = "browser-main-thread",
     target_family = "wasm",

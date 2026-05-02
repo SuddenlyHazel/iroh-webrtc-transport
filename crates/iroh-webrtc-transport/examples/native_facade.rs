@@ -20,8 +20,11 @@ const MAX_BENCHMARK_FRAME_BYTES: usize = 128 * 1024 * 1024;
 async fn main() -> anyhow::Result<()> {
     let remote = std::env::args().nth(1);
 
-    let node =
-        NativeWebRtcIrohNode::spawn(WebRtcNodeConfig::default(), SecretKey::generate()).await?;
+    let node = NativeWebRtcIrohNode::builder(WebRtcNodeConfig::default(), SecretKey::generate())
+        .accept_facade(ALPN)
+        .accept_facade(WORKER_BENCHMARK_ALPN)
+        .spawn()
+        .await?;
     let endpoint_id = node.endpoint_id();
     let endpoint_addr = node.endpoint_addr();
     println!("local endpoint: {endpoint_id}");

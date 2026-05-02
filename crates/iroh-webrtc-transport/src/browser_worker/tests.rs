@@ -3,10 +3,35 @@ use n0_future::{
     task,
     time::{sleep, timeout},
 };
+use std::{
+    collections::VecDeque,
+    sync::{Arc, Mutex as StdMutex},
+};
 
 fn node_with_accept_capacity(capacity: usize) -> BrowserWorkerNode {
     BrowserWorkerNode::spawn(BrowserWorkerNodeConfig {
         accept_queue_capacity: capacity,
+        facade_alpns: vec!["app/alpn".into()],
+        ..BrowserWorkerNodeConfig::default()
+    })
+    .unwrap()
+}
+
+fn node_with_facade_alpn(alpn: &str) -> BrowserWorkerNode {
+    BrowserWorkerNode::spawn(BrowserWorkerNodeConfig {
+        facade_alpns: vec![alpn.into()],
+        ..BrowserWorkerNodeConfig::default()
+    })
+    .unwrap()
+}
+
+fn spawn_payload_with_facade() -> Value {
+    json!({ "facadeAlpns": ["app/alpn"] })
+}
+
+fn node_with_benchmark_alpn(alpn: &str) -> BrowserWorkerNode {
+    BrowserWorkerNode::spawn(BrowserWorkerNodeConfig {
+        benchmark_echo_alpns: vec![alpn.into()],
         ..BrowserWorkerNodeConfig::default()
     })
     .unwrap()
@@ -49,6 +74,213 @@ fn spawn_payload_config_parses_low_latency_quic_acks() {
     assert!(config.low_latency_quic_acks);
 }
 
+#[test]
+fn spawn_payload_config_parses_registered_router_alpns() {
+    let command = WorkerCommand::decode(
+        WORKER_SPAWN_COMMAND,
+        json!({
+            "facadeAlpns": ["app/alpn"],
+            "benchmarkEchoAlpns": ["bench/alpn"]
+        }),
+    )
+    .unwrap();
+    let WorkerCommand::Spawn { config } = command else {
+        panic!("spawn payload decoded to wrong command");
+    };
+    assert_eq!(config.facade_alpns, vec!["app/alpn"]);
+    assert_eq!(config.benchmark_echo_alpns, vec!["bench/alpn"]);
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+enum TestProtocolCommand {
+    Join { topic: String },
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+enum TestProtocolEvent {
+    Joined { topic: String },
+}
+
+#[derive(Debug, Clone, Default)]
+struct TestProtocol {
+    commands: Arc<StdMutex<Vec<TestProtocolCommand>>>,
+    events: Arc<StdMutex<VecDeque<TestProtocolEvent>>>,
+}
+
+impl crate::browser::BrowserWorkerProtocol for TestProtocol {
+    const ALPN: &'static [u8] = b"test/browser-worker-protocol/1";
+
+    type Command = TestProtocolCommand;
+    type Event = TestProtocolEvent;
+    type Handler = TestProtocolHandler;
+
+    fn handler(&self, _endpoint: Endpoint) -> Self::Handler {
+        TestProtocolHandler
+    }
+
+    async fn handle_command(&self, command: Self::Command) -> crate::Result<()> {
+        self.commands
+            .lock()
+            .expect("test protocol mutex poisoned")
+            .push(command);
+        Ok(())
+    }
+
+    async fn next_event(&self) -> crate::Result<Option<Self::Event>> {
+        Ok(self
+            .events
+            .lock()
+            .expect("test protocol mutex poisoned")
+            .pop_front())
+    }
+}
+
+#[derive(Debug, Clone)]
+struct TestProtocolHandler;
+
+impl ProtocolHandler for TestProtocolHandler {
+    async fn accept(&self, _connection: Connection) -> std::result::Result<(), AcceptError> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn typed_worker_protocol_registry_round_trips_command_and_event() {
+    let protocol = TestProtocol::default();
+    protocol
+        .events
+        .lock()
+        .expect("test protocol mutex poisoned")
+        .push_back(TestProtocolEvent::Joined {
+            topic: "rust".into(),
+        });
+    let mut registry = BrowserWorkerProtocolRegistry::new();
+    registry.register(protocol.clone()).unwrap();
+
+    let command = json!({ "Join": { "topic": "rust" } });
+    let result = registry
+        .handle_command("test/browser-worker-protocol/1", command)
+        .await
+        .unwrap();
+    assert_eq!(result, json!({ "handled": true }));
+    assert_eq!(
+        protocol
+            .commands
+            .lock()
+            .expect("test protocol mutex poisoned")
+            .as_slice(),
+        &[TestProtocolCommand::Join {
+            topic: "rust".into()
+        }]
+    );
+
+    let event = registry
+        .next_event("test/browser-worker-protocol/1")
+        .await
+        .unwrap();
+    assert_eq!(event, json!({ "Joined": { "topic": "rust" } }));
+}
+
+#[tokio::test]
+async fn worker_protocol_endpoint_connect_rejects_relay_when_webrtc_only_cannot_prepare() {
+    let mut registry = BrowserWorkerProtocolRegistry::new();
+    registry.register(TestProtocol::default()).unwrap();
+    let node = BrowserWorkerNode::spawn_with_secret_key(
+        BrowserWorkerNodeConfig {
+            worker_protocol_transport_intent: BootstrapTransportIntent::WebRtcOnly,
+            ..BrowserWorkerNodeConfig::default()
+        },
+        SecretKey::generate(),
+        registry,
+    )
+    .unwrap();
+    node.start_endpoint().await.unwrap();
+
+    let endpoint = node.webrtc_endpoint().unwrap();
+    let remote = endpoint_id();
+    let result = timeout(
+        std::time::Duration::from_secs(2),
+        endpoint.connect(
+            remote,
+            <TestProtocol as crate::browser::BrowserWorkerProtocol>::ALPN,
+        ),
+    )
+    .await
+    .expect("WebRTC-only worker protocol connect should reject without hanging");
+
+    let error = result.unwrap_err().to_string();
+    assert!(
+        error.to_ascii_lowercase().contains("rejected locally"),
+        "unexpected connect error: {error}"
+    );
+}
+
+#[tokio::test]
+async fn worker_protocol_endpoint_connect_requests_webrtc_prepare_before_resolution() {
+    let mut registry = BrowserWorkerProtocolRegistry::new();
+    registry.register(TestProtocol::default()).unwrap();
+    let (prepare_tx, mut prepare_rx) = mpsc::channel(1);
+    let node = BrowserWorkerNode::spawn_with_secret_key(
+        BrowserWorkerNodeConfig {
+            worker_protocol_transport_intent: BootstrapTransportIntent::WebRtcOnly,
+            protocol_transport_prepare_tx: Some(prepare_tx),
+            ..BrowserWorkerNodeConfig::default()
+        },
+        SecretKey::generate(),
+        registry,
+    )
+    .unwrap();
+    node.start_endpoint().await.unwrap();
+
+    let endpoint = node.webrtc_endpoint().unwrap();
+    let remote = endpoint_id();
+    let connect = endpoint.connect(
+        remote,
+        <TestProtocol as crate::browser::BrowserWorkerProtocol>::ALPN,
+    );
+    tokio::pin!(connect);
+
+    let request = tokio::select! {
+        request = prepare_rx.recv() => request.expect("prepare request should be sent"),
+        result = &mut connect => panic!("connect finished before transport preparation: {result:?}"),
+    };
+
+    assert_eq!(request.remote, remote);
+    assert_eq!(
+        request.alpn.as_bytes(),
+        <TestProtocol as crate::browser::BrowserWorkerProtocol>::ALPN
+    );
+    assert_eq!(
+        request.transport_intent,
+        BootstrapTransportIntent::WebRtcOnly
+    );
+
+    let dial_id = DialId([7; 16]);
+    node.add_protocol_transport_session_addr(remote, dial_id)
+        .unwrap();
+    request.response.send(Ok(())).unwrap();
+    let prepared_addr = node
+        .protocol_transport_endpoint_addr(remote)
+        .expect("prepared custom address should be stored in worker protocol lookup");
+
+    assert!(prepared_addr.addrs.iter().any(|addr| {
+        let TransportAddr::Custom(custom_addr) = addr else {
+            return false;
+        };
+        matches!(
+            WebRtcAddr::from_custom_addr(custom_addr),
+            Ok(addr) if addr == WebRtcAddr::session(remote, dial_id.0)
+        )
+    }));
+}
+
+#[test]
+fn worker_protocol_registry_rejects_duplicate_protocol_type_and_alpn() {
+    let mut registry = BrowserWorkerProtocolRegistry::new();
+    registry.register(TestProtocol::default()).unwrap();
+    assert!(registry.register(TestProtocol::default()).is_err());
+}
+
 fn direct_addrs_for(node: &BrowserWorkerNode) -> Vec<String> {
     let addrs = node.endpoint_addr().unwrap();
     let direct_addrs = addrs
@@ -68,7 +300,7 @@ fn direct_addrs_for(node: &BrowserWorkerNode) -> Vec<String> {
 
 #[test]
 fn duplicate_accept_registration_is_rejected() {
-    let node = BrowserWorkerNode::spawn_default().unwrap();
+    let node = node_with_facade_alpn("app/alpn");
     let first = node.accept_open("app/alpn").unwrap();
 
     assert_eq!(first.alpn, "app/alpn");
@@ -80,15 +312,15 @@ fn duplicate_accept_registration_is_rejected() {
 
 #[test]
 fn accept_close_releases_registration_for_recreation() {
-    let node = BrowserWorkerNode::spawn_default().unwrap();
+    let node = node_with_facade_alpn("app/alpn");
     let first = node.accept_open("app/alpn").unwrap();
 
     assert!(node.is_alpn_registered("app/alpn"));
     assert!(node.accept_close(first.id).unwrap());
-    assert!(!node.is_alpn_registered("app/alpn"));
+    assert!(node.is_alpn_registered("app/alpn"));
 
     let second = node.accept_open("app/alpn").unwrap();
-    assert_ne!(first.id, second.id);
+    assert_eq!(first.id, second.id);
     assert!(node.is_alpn_registered("app/alpn"));
 }
 
@@ -127,7 +359,7 @@ async fn accept_queue_overflow_rejects_new_connection() {
 
 #[tokio::test]
 async fn node_close_completes_pending_accept_next() {
-    let node = BrowserWorkerNode::spawn_default().unwrap();
+    let node = node_with_facade_alpn("app/alpn");
     let registration = node.accept_open("app/alpn").unwrap();
     let pending = {
         let node = node.clone();
@@ -155,6 +387,29 @@ fn inactive_alpn_is_rejected_for_incoming_connections() {
         ),
         BrowserWorkerErrorCode::UnsupportedAlpn,
     );
+}
+
+#[test]
+fn bootstrap_dial_request_accepts_registered_benchmark_alpn() {
+    let node = node_with_benchmark_alpn("bench/alpn");
+    let local = node.endpoint_id();
+    let remote = endpoint_id();
+    let signal = WebRtcSignal::dial_request_with_alpn(
+        DialId([8; 16]),
+        remote,
+        local,
+        1,
+        "bench/alpn",
+        BootstrapTransportIntent::WebRtcOnly,
+    );
+
+    let result = node
+        .handle_bootstrap_signal(WorkerBootstrapSignalInput { signal, alpn: None })
+        .unwrap();
+
+    assert!(result.accepted);
+    assert_eq!(result.session.unwrap().alpn, "bench/alpn");
+    assert_eq!(result.main_rtc.len(), 1);
 }
 
 #[test]
@@ -296,7 +551,7 @@ fn dial_completion_enforces_transport_preference() {
 
 #[test]
 fn bootstrap_dial_request_consumes_transport_intent() {
-    let node = BrowserWorkerNode::spawn_default().unwrap();
+    let node = node_with_facade_alpn("app/alpn");
     let local = node.endpoint_id();
     let remote = endpoint_id();
     node.accept_open("app/alpn").unwrap();
@@ -693,7 +948,7 @@ fn main_rtc_result_emits_offer_and_local_ice_protocol_signals() {
 
 #[test]
 fn remote_bootstrap_signals_drive_main_rtc_command_sequence() {
-    let node = BrowserWorkerNode::spawn_default().unwrap();
+    let node = node_with_facade_alpn("app/alpn");
     let local = node.endpoint_id();
     let remote = endpoint_id();
     node.accept_open("app/alpn").unwrap();
@@ -841,7 +1096,7 @@ fn webrtc_dialer_promotes_only_after_transferred_channel_opens() {
 
 #[test]
 fn webrtc_acceptor_promotion_queues_through_alpn_gate() {
-    let node = BrowserWorkerNode::spawn_default().unwrap();
+    let node = node_with_facade_alpn("app/alpn");
     let registration = node.accept_open("app/alpn").unwrap();
     let local = node.endpoint_id();
     let remote = endpoint_id();
@@ -920,7 +1175,10 @@ async fn command_dispatch_spawn_and_accept_use_protocol_shapes() {
     let spawn = runtime
         .handle_command_value(
             WORKER_SPAWN_COMMAND,
-            json!({ "stunUrls": ["stun:stun.example.test:3478"] }),
+            json!({
+                "stunUrls": ["stun:stun.example.test:3478"],
+                "facadeAlpns": ["app/alpn"]
+            }),
         )
         .await
         .unwrap();
@@ -950,8 +1208,8 @@ async fn concurrent_spawn_requests_share_runtime_node() {
     let runtime = BrowserWorkerRuntimeCore::new();
 
     let (first, second) = tokio::join!(
-        runtime.handle_command_value(WORKER_SPAWN_COMMAND, json!({})),
-        runtime.handle_command_value(WORKER_SPAWN_COMMAND, json!({}))
+        runtime.handle_command_value(WORKER_SPAWN_COMMAND, spawn_payload_with_facade()),
+        runtime.handle_command_value(WORKER_SPAWN_COMMAND, spawn_payload_with_facade())
     );
     let first = first.unwrap();
     let second = second.unwrap();
@@ -969,7 +1227,7 @@ async fn message_dispatch_returns_canonical_response_envelopes() {
             "kind": "request",
             "id": 1,
             "command": WORKER_SPAWN_COMMAND,
-            "payload": {}
+            "payload": { "facadeAlpns": ["app/alpn"] }
         }))
         .await
         .unwrap()
@@ -1044,7 +1302,7 @@ async fn message_dispatch_turns_command_errors_into_wire_response() {
 async fn command_dispatch_accepts_protocol_bootstrap_session_signal() {
     let runtime = BrowserWorkerRuntimeCore::new();
     let spawn = runtime
-        .handle_command_value(WORKER_SPAWN_COMMAND, json!({}))
+        .handle_command_value(WORKER_SPAWN_COMMAND, spawn_payload_with_facade())
         .await
         .unwrap();
     runtime
@@ -1085,7 +1343,7 @@ async fn command_dispatch_accepts_protocol_bootstrap_session_signal() {
 async fn command_dispatch_consumes_main_rtc_results_and_promotes_webrtc() {
     let runtime = BrowserWorkerRuntimeCore::new();
     runtime
-        .handle_command_value(WORKER_SPAWN_COMMAND, json!({}))
+        .handle_command_value(WORKER_SPAWN_COMMAND, spawn_payload_with_facade())
         .await
         .unwrap();
     let node = runtime.node().unwrap().clone();
@@ -1141,7 +1399,7 @@ async fn command_dispatch_consumes_main_rtc_results_and_promotes_webrtc() {
 async fn command_dispatch_closed_dial_returns_wire_error() {
     let runtime = BrowserWorkerRuntimeCore::new();
     let spawn = runtime
-        .handle_command_value(WORKER_SPAWN_COMMAND, json!({}))
+        .handle_command_value(WORKER_SPAWN_COMMAND, spawn_payload_with_facade())
         .await
         .unwrap();
     runtime
@@ -1172,11 +1430,11 @@ async fn command_dispatch_relay_dial_and_stream_bridge_use_iroh_connection() {
     let server = BrowserWorkerRuntimeCore::new();
     let client = BrowserWorkerRuntimeCore::new();
     let server_spawn = server
-        .handle_command_value(WORKER_SPAWN_COMMAND, json!({}))
+        .handle_command_value(WORKER_SPAWN_COMMAND, spawn_payload_with_facade())
         .await
         .unwrap();
     client
-        .handle_command_value(WORKER_SPAWN_COMMAND, json!({}))
+        .handle_command_value(WORKER_SPAWN_COMMAND, spawn_payload_with_facade())
         .await
         .unwrap();
     let accept = server
@@ -1277,11 +1535,11 @@ async fn command_dispatch_stream_close_send_reaches_remote_receive_done() {
     let server = BrowserWorkerRuntimeCore::new();
     let client = BrowserWorkerRuntimeCore::new();
     let server_spawn = server
-        .handle_command_value(WORKER_SPAWN_COMMAND, json!({}))
+        .handle_command_value(WORKER_SPAWN_COMMAND, spawn_payload_with_facade())
         .await
         .unwrap();
     client
-        .handle_command_value(WORKER_SPAWN_COMMAND, json!({}))
+        .handle_command_value(WORKER_SPAWN_COMMAND, spawn_payload_with_facade())
         .await
         .unwrap();
     let accept = server
@@ -1378,11 +1636,11 @@ async fn command_dispatch_webrtc_preferred_falls_back_to_relay_connection() {
     let server = BrowserWorkerRuntimeCore::new();
     let client = BrowserWorkerRuntimeCore::new();
     let server_spawn = server
-        .handle_command_value(WORKER_SPAWN_COMMAND, json!({}))
+        .handle_command_value(WORKER_SPAWN_COMMAND, spawn_payload_with_facade())
         .await
         .unwrap();
     client
-        .handle_command_value(WORKER_SPAWN_COMMAND, json!({}))
+        .handle_command_value(WORKER_SPAWN_COMMAND, spawn_payload_with_facade())
         .await
         .unwrap();
     server
@@ -1414,7 +1672,7 @@ async fn command_dispatch_webrtc_preferred_falls_back_to_relay_connection() {
 async fn command_dispatch_webrtc_only_failure_does_not_create_relay_connection() {
     let runtime = BrowserWorkerRuntimeCore::new();
     let spawn = runtime
-        .handle_command_value(WORKER_SPAWN_COMMAND, json!({}))
+        .handle_command_value(WORKER_SPAWN_COMMAND, spawn_payload_with_facade())
         .await
         .unwrap();
 
@@ -1437,7 +1695,7 @@ async fn command_dispatch_webrtc_only_failure_does_not_create_relay_connection()
 async fn stream_cancel_pending_returns_false_for_unknown_stream() {
     let runtime = BrowserWorkerRuntimeCore::new();
     runtime
-        .handle_command_value(WORKER_SPAWN_COMMAND, json!({}))
+        .handle_command_value(WORKER_SPAWN_COMMAND, spawn_payload_with_facade())
         .await
         .unwrap();
 
@@ -1457,11 +1715,11 @@ async fn stream_cancel_pending_wakes_pending_receive() {
     let server = BrowserWorkerRuntimeCore::new();
     let client = BrowserWorkerRuntimeCore::new();
     let server_spawn = server
-        .handle_command_value(WORKER_SPAWN_COMMAND, json!({}))
+        .handle_command_value(WORKER_SPAWN_COMMAND, spawn_payload_with_facade())
         .await
         .unwrap();
     client
-        .handle_command_value(WORKER_SPAWN_COMMAND, json!({}))
+        .handle_command_value(WORKER_SPAWN_COMMAND, spawn_payload_with_facade())
         .await
         .unwrap();
     let accept = server

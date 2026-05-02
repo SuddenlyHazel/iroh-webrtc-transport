@@ -1,10 +1,28 @@
-use std::{cell::RefCell, rc::Rc};
-
-use iroh_webrtc_transport::browser::{
-    BrowserDialOptions, BrowserWebRtcConnection, BrowserWebRtcNode, BrowserWebRtcNodeConfig,
-    BrowserWebRtcStream,
+use std::{
+    cell::RefCell,
+    collections::HashMap,
+    rc::Rc,
+    str::FromStr,
+    sync::{Arc, Mutex as StdMutex},
 };
+
+use bytes::Bytes;
+use iroh::{Endpoint, EndpointId};
+use iroh_gossip::{
+    TopicId,
+    api::{Event as GossipEvent, GossipSender},
+    net::{GOSSIP_ALPN, Gossip},
+};
+use iroh_webrtc_transport::{
+    Error, Result,
+    browser::{
+        BrowserDialTransportPreference, BrowserProtocolHandle, BrowserWebRtcNode,
+        BrowserWebRtcNodeConfig, BrowserWorkerProtocol,
+    },
+};
+use n0_future::{StreamExt, task};
 use serde::{Deserialize, Serialize};
+use tokio::sync::{Mutex as AsyncMutex, mpsc};
 use wasm_bindgen::{JsCast, prelude::*};
 use wasm_bindgen_futures::spawn_local;
 use web_sys::{
@@ -12,22 +30,43 @@ use web_sys::{
     KeyboardEvent,
 };
 
-const ALPN: &[u8] = b"example/iroh-webrtc-rust-browser-chat-room/1";
-const MAX_FRAME_BYTES: usize = 256 * 1024;
+const CHAT_TOPIC_BYTES: [u8; 32] = [0x42; 32];
 
 iroh_webrtc_transport::browser_app! {
     app = start_app => run_app;
-    worker = start_iroh_webrtc_worker;
+    worker = start_iroh_webrtc_worker => {
+        protocols = [ChatGossipProtocol::default()]
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
-enum ChatFrame {
+enum ChatGossipCommand {
     Join {
+        topic: String,
+        peers: Vec<String>,
+        endpoint: String,
         name: String,
     },
-    Welcome {
-        host_name: String,
+    Send {
+        topic: String,
+        from_endpoint: String,
+        from_name: String,
+        text: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+enum ChatGossipEvent {
+    Joined {
+        topic: String,
+    },
+    NeighborUp {
+        endpoint: String,
+    },
+    NeighborDown {
+        endpoint: String,
     },
     Chat {
         from_endpoint: String,
@@ -39,11 +78,222 @@ enum ChatFrame {
     },
 }
 
-#[derive(Clone)]
-struct Peer {
-    endpoint_id: String,
-    name: String,
-    stream: BrowserWebRtcStream,
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+enum ChatWireMessage {
+    AboutMe {
+        endpoint: String,
+        name: String,
+    },
+    Chat {
+        from_endpoint: String,
+        from_name: String,
+        text: String,
+    },
+}
+
+#[derive(Debug, Clone)]
+struct ChatGossipProtocol {
+    gossip: Arc<StdMutex<Option<Gossip>>>,
+    topics: Arc<StdMutex<HashMap<String, GossipSender>>>,
+    events_tx: mpsc::UnboundedSender<ChatGossipEvent>,
+    events_rx: Arc<AsyncMutex<mpsc::UnboundedReceiver<ChatGossipEvent>>>,
+}
+
+impl Default for ChatGossipProtocol {
+    fn default() -> Self {
+        let (events_tx, events_rx) = mpsc::unbounded_channel();
+        Self {
+            gossip: Arc::new(StdMutex::new(None)),
+            topics: Arc::new(StdMutex::new(HashMap::new())),
+            events_tx,
+            events_rx: Arc::new(AsyncMutex::new(events_rx)),
+        }
+    }
+}
+
+impl BrowserWorkerProtocol for ChatGossipProtocol {
+    const ALPN: &'static [u8] = GOSSIP_ALPN;
+
+    type Command = ChatGossipCommand;
+    type Event = ChatGossipEvent;
+    type Handler = Gossip;
+
+    fn handler(&self, endpoint: Endpoint) -> Self::Handler {
+        self.gossip(endpoint)
+    }
+
+    async fn handle_command(&self, command: Self::Command) -> Result<()> {
+        match command {
+            ChatGossipCommand::Join {
+                topic,
+                peers,
+                endpoint,
+                name,
+            } => {
+                let topic_id = parse_topic(&topic)?;
+                let peers = parse_peers(&peers)?;
+                let gossip = self.existing_gossip()?;
+                let topic_handle = gossip
+                    .subscribe(topic_id, peers)
+                    .await
+                    .map_err(error_from_display)?;
+                let (sender, mut receiver) = topic_handle.split();
+                self.topics
+                    .lock()
+                    .expect("chat gossip topic mutex poisoned")
+                    .insert(topic.clone(), sender.clone());
+                let events = self.events_tx.clone();
+                let topic_for_task = topic.clone();
+                let sender_for_task = sender.clone();
+                let endpoint_for_task = endpoint.clone();
+                let name_for_task = name.clone();
+                task::spawn(async move {
+                    while let Some(event) = receiver.next().await {
+                        match event {
+                            Ok(GossipEvent::NeighborUp(endpoint)) => {
+                                let _ = events.send(ChatGossipEvent::NeighborUp {
+                                    endpoint: endpoint.to_string(),
+                                });
+                                if let Err(error) = broadcast_wire(
+                                    &sender_for_task,
+                                    ChatWireMessage::AboutMe {
+                                        endpoint: endpoint_for_task.clone(),
+                                        name: name_for_task.clone(),
+                                    },
+                                )
+                                .await
+                                {
+                                    let _ = events.send(ChatGossipEvent::System {
+                                        text: format!("failed to announce peer: {error}"),
+                                    });
+                                }
+                            }
+                            Ok(GossipEvent::NeighborDown(endpoint)) => {
+                                let _ = events.send(ChatGossipEvent::NeighborDown {
+                                    endpoint: endpoint.to_string(),
+                                });
+                            }
+                            Ok(GossipEvent::Received(message)) => {
+                                if let Ok(message) =
+                                    serde_json::from_slice::<ChatWireMessage>(&message.content)
+                                {
+                                    match message {
+                                        ChatWireMessage::AboutMe { endpoint, name } => {
+                                            let _ = events.send(ChatGossipEvent::System {
+                                                text: format!("{name} joined ({endpoint})"),
+                                            });
+                                        }
+                                        ChatWireMessage::Chat {
+                                            from_endpoint,
+                                            from_name,
+                                            text,
+                                        } => {
+                                            let _ = events.send(ChatGossipEvent::Chat {
+                                                from_endpoint,
+                                                from_name,
+                                                text,
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                            Ok(GossipEvent::Lagged) => {
+                                let _ = events.send(ChatGossipEvent::System {
+                                    text: "missed gossip messages".into(),
+                                });
+                            }
+                            Err(error) => {
+                                let _ = events.send(ChatGossipEvent::System {
+                                    text: format!("gossip receive error: {error}"),
+                                });
+                                break;
+                            }
+                        }
+                    }
+                    let _ = events.send(ChatGossipEvent::System {
+                        text: format!("left topic {topic_for_task}"),
+                    });
+                });
+                let _ = self.events_tx.send(ChatGossipEvent::Joined {
+                    topic: topic.clone(),
+                });
+                broadcast_wire(&sender, ChatWireMessage::AboutMe { endpoint, name }).await?;
+            }
+            ChatGossipCommand::Send {
+                topic,
+                from_endpoint,
+                from_name,
+                text,
+            } => {
+                let sender = self
+                    .topics
+                    .lock()
+                    .expect("chat gossip topic mutex poisoned")
+                    .get(&topic)
+                    .cloned()
+                    .ok_or_else(|| Error::WebRtc(format!("not joined to gossip topic {topic}")))?;
+                broadcast_wire(
+                    &sender,
+                    ChatWireMessage::Chat {
+                        from_endpoint,
+                        from_name,
+                        text,
+                    },
+                )
+                .await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn next_event(&self) -> Result<Option<Self::Event>> {
+        Ok(self.events_rx.lock().await.recv().await)
+    }
+}
+
+impl ChatGossipProtocol {
+    fn gossip(&self, endpoint: Endpoint) -> Gossip {
+        let mut gossip = self.gossip.lock().expect("chat gossip mutex poisoned");
+        if let Some(gossip) = gossip.as_ref() {
+            return gossip.clone();
+        }
+        let spawned = Gossip::builder().spawn(endpoint);
+        *gossip = Some(spawned.clone());
+        spawned
+    }
+
+    fn existing_gossip(&self) -> Result<Gossip> {
+        self.gossip
+            .lock()
+            .expect("chat gossip mutex poisoned")
+            .clone()
+            .ok_or_else(|| Error::WebRtc("gossip handler has not been registered".into()))
+    }
+}
+
+async fn broadcast_wire(sender: &GossipSender, message: ChatWireMessage) -> Result<()> {
+    let encoded = serde_json::to_vec(&message)
+        .map_err(|error| Error::WebRtc(format!("failed to encode chat message: {error}")))?;
+    sender
+        .broadcast(Bytes::from(encoded))
+        .await
+        .map_err(error_from_display)
+}
+
+fn parse_topic(topic: &str) -> Result<TopicId> {
+    TopicId::from_str(topic).map_err(error_from_display)
+}
+
+fn parse_peers(peers: &[String]) -> Result<Vec<EndpointId>> {
+    peers
+        .iter()
+        .map(|peer| EndpointId::from_str(peer).map_err(error_from_display))
+        .collect()
+}
+
+fn error_from_display(error: impl std::fmt::Display) -> Error {
+    Error::WebRtc(error.to_string())
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -53,13 +303,19 @@ enum RoomMode {
 }
 
 struct AppState {
-    node: BrowserWebRtcNode,
+    _node: BrowserWebRtcNode,
+    gossip: BrowserProtocolHandle<ChatGossipProtocol>,
+    topic: String,
     local_endpoint: String,
     mode: Option<RoomMode>,
     local_name: String,
-    peers: Vec<Peer>,
+    seed_endpoint: Option<String>,
+    topic_joined: bool,
+    messages_sent: usize,
+    messages_received: usize,
+    lagged_events: usize,
+    last_gossip_event: String,
     remote_names: Vec<String>,
-    host_stream: Option<BrowserWebRtcStream>,
     document: Document,
     host_input: HtmlInputElement,
     name_input: HtmlInputElement,
@@ -69,28 +325,42 @@ struct AppState {
     join_button: HtmlButtonElement,
     room_endpoint: Element,
     participants: Element,
+    gossip_state: Element,
     messages: HtmlElement,
     status: Element,
 }
 
-async fn run_app() -> Result<(), JsValue> {
+async fn run_app() -> std::result::Result<(), JsValue> {
     console_error_panic_hook::set_once();
     iroh_webrtc_transport::browser::install_browser_console_tracing();
 
     let document = document()?;
     let local = element::<HtmlInputElement>(&document, "local")?;
-    let node = BrowserWebRtcNode::spawn(BrowserWebRtcNodeConfig::default()).await?;
+    let node = BrowserWebRtcNode::builder(
+        BrowserWebRtcNodeConfig::default()
+            .with_worker_protocol_transport_preference(BrowserDialTransportPreference::WebRtcOnly),
+    )
+        .spawn()
+        .await?;
+    let gossip = node.protocol::<ChatGossipProtocol>().await?;
     let local_endpoint = node.endpoint_id().to_owned();
+    let topic = TopicId::from_bytes(CHAT_TOPIC_BYTES).to_string();
     local.set_value(&local_endpoint);
 
     let state = Rc::new(RefCell::new(AppState {
-        node,
+        _node: node,
+        gossip,
+        topic,
         local_endpoint: local_endpoint.clone(),
         mode: None,
         local_name: "Browser peer".to_owned(),
-        peers: Vec::new(),
+        seed_endpoint: None,
+        topic_joined: false,
+        messages_sent: 0,
+        messages_received: 0,
+        lagged_events: 0,
+        last_gossip_event: "idle".to_owned(),
         remote_names: Vec::new(),
-        host_stream: None,
         document: document.clone(),
         host_input: element(&document, "host")?,
         name_input: element(&document, "name")?,
@@ -100,17 +370,29 @@ async fn run_app() -> Result<(), JsValue> {
         join_button: element(&document, "join-room")?,
         room_endpoint: element(&document, "room-endpoint")?,
         participants: element(&document, "participants")?,
+        gossip_state: element(&document, "gossip-state")?,
         messages: element(&document, "messages")?,
         status: element(&document, "status")?,
     }));
 
     set_status(&state, &format!("local endpoint: {local_endpoint}"));
     render_participants(&state)?;
+    render_gossip_state(&state)?;
     wire_controls(state)?;
     Ok(())
 }
 
-fn wire_controls(state: Rc<RefCell<AppState>>) -> Result<(), JsValue> {
+fn wire_controls(state: Rc<RefCell<AppState>>) -> std::result::Result<(), JsValue> {
+    let events_state = state.clone();
+    spawn_local(async move {
+        if let Err(error) = poll_gossip_events(events_state.clone()).await {
+            append_system(
+                &events_state,
+                &format!("event error: {}", js_error_text(error)),
+            );
+        }
+    });
+
     let host_state = state.clone();
     let on_host = Closure::wrap(Box::new(move |_event: web_sys::Event| {
         let state = host_state.clone();
@@ -178,8 +460,8 @@ fn wire_controls(state: Rc<RefCell<AppState>>) -> Result<(), JsValue> {
     Ok(())
 }
 
-async fn host_room(state: Rc<RefCell<AppState>>) -> Result<(), JsValue> {
-    let (node, endpoint, name) = {
+async fn host_room(state: Rc<RefCell<AppState>>) -> std::result::Result<(), JsValue> {
+    let (gossip, topic, endpoint, name) = {
         let mut state = state.borrow_mut();
         if state.mode.is_some() {
             append_system_from_state(&state, "already connected to a room")?;
@@ -187,54 +469,40 @@ async fn host_room(state: Rc<RefCell<AppState>>) -> Result<(), JsValue> {
         }
         state.local_name = display_name(&state.name_input);
         state.mode = Some(RoomMode::Hosting);
+        state.seed_endpoint = None;
+        state.topic_joined = false;
+        state.last_gossip_event = "hosting topic".to_owned();
         state
             .room_endpoint
             .set_text_content(Some(&state.local_endpoint));
-        state.message_input.set_disabled(false);
-        state.send_button.set_disabled(false);
         state.host_button.set_disabled(true);
         state.join_button.set_disabled(true);
+        set_status_from_state(&state, "hosting; share your local endpoint")?;
+        update_send_controls_from_state(&state)?;
         (
-            state.node.clone(),
+            state.gossip.clone(),
+            state.topic.clone(),
             state.local_endpoint.clone(),
             state.local_name.clone(),
         )
     };
 
+    gossip
+        .send(ChatGossipCommand::Join {
+            topic,
+            peers: Vec::new(),
+            endpoint,
+            name: name.clone(),
+        })
+        .await?;
     append_system(&state, &format!("{name} is hosting"));
     render_participants(&state)?;
-    set_status(&state, "hosting; share your local endpoint");
-
-    let acceptor = node.accept(ALPN).await?;
-    let accept_state = state.clone();
-    spawn_local(async move {
-        loop {
-            let connection = match acceptor.accept().await {
-                Ok(Some(connection)) => connection,
-                Ok(None) => return,
-                Err(error) => {
-                    append_system(
-                        &accept_state,
-                        &format!("accept error: {}", js_error_text(error)),
-                    );
-                    return;
-                }
-            };
-            let state = accept_state.clone();
-            spawn_local(async move {
-                if let Err(error) = handle_host_connection(state.clone(), connection).await {
-                    append_system(&state, &format!("peer error: {}", js_error_text(error)));
-                }
-            });
-        }
-    });
-
-    append_system(&state, &format!("room endpoint: {endpoint}"));
+    render_gossip_state(&state)?;
     Ok(())
 }
 
-async fn join_room(state: Rc<RefCell<AppState>>) -> Result<(), JsValue> {
-    let (node, host, name) = {
+async fn join_room(state: Rc<RefCell<AppState>>) -> std::result::Result<(), JsValue> {
+    let (gossip, topic, host, endpoint, name) = {
         let mut state = state.borrow_mut();
         if state.mode.is_some() {
             append_system_from_state(&state, "already connected to a room")?;
@@ -250,316 +518,236 @@ async fn join_room(state: Rc<RefCell<AppState>>) -> Result<(), JsValue> {
             return Ok(());
         }
         state.local_name = display_name(&state.name_input);
+        state.mode = Some(RoomMode::Joined);
+        state.seed_endpoint = Some(host.clone());
+        state.topic_joined = false;
+        state.last_gossip_event = format!("joining through {host}");
+        state.room_endpoint.set_text_content(Some(&host));
         state.host_button.set_disabled(true);
         state.join_button.set_disabled(true);
         set_status_from_state(&state, &format!("joining {host}"))?;
-        (state.node.clone(), host, state.local_name.clone())
+        update_send_controls_from_state(&state)?;
+        (
+            state.gossip.clone(),
+            state.topic.clone(),
+            host,
+            state.local_endpoint.clone(),
+            state.local_name.clone(),
+        )
     };
 
-    let connection = node
-        .dial(&host, ALPN, BrowserDialOptions::webrtc_only())
+    gossip
+        .send(ChatGossipCommand::Join {
+            topic,
+            peers: vec![host.clone()],
+            endpoint,
+            name: name.clone(),
+        })
         .await?;
-    let stream = connection.open_bi().await?;
-    send_frame(&stream, &ChatFrame::Join { name: name.clone() }).await?;
-
-    {
-        let mut state = state.borrow_mut();
-        state.mode = Some(RoomMode::Joined);
-        state.host_stream = Some(stream.clone());
-        state.room_endpoint.set_text_content(Some(&host));
-        state.message_input.set_disabled(false);
-        state.send_button.set_disabled(false);
-        set_status_from_state(&state, "joined")?;
-    }
     append_system(&state, &format!("{name} joined the room"));
     render_participants(&state)?;
-
-    spawn_local(read_host_messages(state, stream, connection));
+    render_gossip_state(&state)?;
     Ok(())
 }
 
-async fn handle_host_connection(
-    state: Rc<RefCell<AppState>>,
-    connection: BrowserWebRtcConnection,
-) -> Result<(), JsValue> {
-    let stream = connection.accept_bi().await?;
-    let mut reader = FrameReader::new(stream.clone());
-    let Some(ChatFrame::Join { name }) = reader.read_frame().await? else {
-        return Err(JsValue::from_str("peer did not send a join frame"));
-    };
-    let remote = connection.remote_endpoint_id().to_owned();
-    {
-        state.borrow_mut().peers.push(Peer {
-            endpoint_id: remote.clone(),
-            name: name.clone(),
-            stream: stream.clone(),
-        });
-    }
-    let host_name = state.borrow().local_name.clone();
-    send_frame(&stream, &ChatFrame::Welcome { host_name }).await?;
-    append_system(&state, &format!("{name} joined"));
-    render_participants(&state)?;
-    broadcast_to_clients_except(
-        &state,
-        &ChatFrame::System {
-            text: format!("{name} joined"),
-        },
-        &remote,
-    )
-    .await;
-
-    while let Some(frame) = reader.read_frame().await? {
-        if let ChatFrame::Chat {
-            from_endpoint: _,
-            from_name: _,
-            text,
-        } = frame
-        {
-            let frame = ChatFrame::Chat {
-                from_endpoint: remote.clone(),
-                from_name: name.clone(),
-                text,
-            };
-            if let ChatFrame::Chat {
-                from_endpoint,
-                from_name,
-                text,
-            } = &frame
-            {
-                append_chat(&state, from_endpoint, from_name, text);
-            }
-            broadcast_to_clients(&state, &frame).await;
-        }
-    }
-
-    remove_peer(&state, &remote)?;
-    append_system(&state, &format!("{name} left"));
-    broadcast_to_clients_except(
-        &state,
-        &ChatFrame::System {
-            text: format!("{name} left"),
-        },
-        &remote,
-    )
-    .await;
-    Ok(())
-}
-
-async fn read_host_messages(
-    state: Rc<RefCell<AppState>>,
-    stream: BrowserWebRtcStream,
-    connection: BrowserWebRtcConnection,
-) {
-    let mut reader = FrameReader::new(stream);
-    loop {
-        match reader.read_frame().await {
-            Ok(Some(ChatFrame::Welcome { host_name })) => {
-                {
-                    let mut state = state.borrow_mut();
-                    state.remote_names.clear();
-                    state.remote_names.push(format!("{host_name} (host)"));
-                }
-                let _ = render_participants(&state);
-            }
-            Ok(Some(ChatFrame::Chat {
-                from_endpoint,
-                from_name,
-                text,
-            })) => append_chat(&state, &from_endpoint, &from_name, &text),
-            Ok(Some(ChatFrame::System { text })) => append_system(&state, &text),
-            Ok(Some(ChatFrame::Join { .. })) => {}
-            Ok(None) => {
-                append_system(&state, "host closed the room");
-                break;
-            }
-            Err(error) => {
-                append_system(&state, &format!("read error: {}", js_error_text(error)));
-                break;
-            }
-        }
-    }
-    let _ = connection.close("chat reader stopped").await;
-}
-
-async fn send_current_message(state: Rc<RefCell<AppState>>) -> Result<(), JsValue> {
-    let (mode, from_endpoint, from_name, text, host_stream, peers) = {
+async fn send_current_message(state: Rc<RefCell<AppState>>) -> std::result::Result<(), JsValue> {
+    let (gossip, topic, from_endpoint, from_name, text, connected) = {
         let state = state.borrow();
         let text = state.message_input.value().trim().to_owned();
         if text.is_empty() {
             return Ok(());
         }
         (
-            state.mode,
+            state.gossip.clone(),
+            state.topic.clone(),
             state.local_endpoint.clone(),
             state.local_name.clone(),
             text,
-            state.host_stream.clone(),
-            state.peers.clone(),
+            state.mode.is_some(),
         )
     };
     state.borrow().message_input.set_value("");
-
-    match mode {
-        Some(RoomMode::Hosting) => {
-            append_chat(&state, &from_endpoint, &from_name, &text);
-            let frame = ChatFrame::Chat {
-                from_endpoint,
-                from_name,
-                text,
-            };
-            for peer in peers {
-                if let Err(error) = send_frame(&peer.stream, &frame).await {
-                    append_system(
-                        &state,
-                        &format!("failed to send to {}: {}", peer.name, js_error_text(error)),
-                    );
-                }
-            }
-        }
-        Some(RoomMode::Joined) => {
-            let Some(stream) = host_stream else {
-                return Err(JsValue::from_str("missing host stream"));
-            };
-            send_frame(
-                &stream,
-                &ChatFrame::Chat {
-                    from_endpoint,
-                    from_name,
-                    text,
-                },
-            )
-            .await?;
-        }
-        None => append_system(&state, "host or join a room first"),
+    if !connected {
+        append_system(&state, "host or join a room first");
+        return Ok(());
     }
 
+    append_chat(&state, &from_endpoint, &from_name, &text);
+    gossip
+        .send(ChatGossipCommand::Send {
+            topic,
+            from_endpoint,
+            from_name,
+            text,
+        })
+        .await?;
+    {
+        let mut state = state.borrow_mut();
+        state.messages_sent += 1;
+        state.last_gossip_event = "broadcast chat message".to_owned();
+    }
+    render_gossip_state(&state)?;
     Ok(())
 }
 
-async fn broadcast_to_clients(state: &Rc<RefCell<AppState>>, frame: &ChatFrame) {
-    broadcast_to_clients_except(state, frame, "").await;
-}
-
-async fn broadcast_to_clients_except(
-    state: &Rc<RefCell<AppState>>,
-    frame: &ChatFrame,
-    excluded_endpoint: &str,
-) {
-    let peers = state.borrow().peers.clone();
-    for peer in peers {
-        if peer.endpoint_id == excluded_endpoint {
+async fn poll_gossip_events(state: Rc<RefCell<AppState>>) -> std::result::Result<(), JsValue> {
+    let gossip = state.borrow().gossip.clone();
+    loop {
+        let Some(event) = gossip.next_event().await? else {
             continue;
-        }
-        if let Err(error) = send_frame(&peer.stream, frame).await {
-            append_system(
-                state,
-                &format!("failed to send to {}: {}", peer.name, js_error_text(error)),
-            );
-        }
-    }
-}
-
-async fn send_frame(stream: &BrowserWebRtcStream, frame: &ChatFrame) -> Result<(), JsValue> {
-    let payload = serde_json::to_vec(frame)
-        .map_err(|error| JsValue::from_str(&format!("failed to encode chat frame: {error}")))?;
-    if payload.len() > MAX_FRAME_BYTES {
-        return Err(JsValue::from_str("chat frame is too large"));
-    }
-    let mut out = Vec::with_capacity(4 + payload.len());
-    out.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-    out.extend_from_slice(&payload);
-    stream.send_all(&out).await
-}
-
-struct FrameReader {
-    stream: BrowserWebRtcStream,
-    buffer: Vec<u8>,
-    eof: bool,
-}
-
-impl FrameReader {
-    fn new(stream: BrowserWebRtcStream) -> Self {
-        Self {
-            stream,
-            buffer: Vec::new(),
-            eof: false,
-        }
-    }
-
-    async fn read_frame(&mut self) -> Result<Option<ChatFrame>, JsValue> {
-        if !self.fill_until(4).await? {
-            if self.buffer.is_empty() {
-                return Ok(None);
+        };
+        match event {
+            ChatGossipEvent::Joined { topic } => {
+                {
+                    let mut state = state.borrow_mut();
+                    state.topic_joined = true;
+                    state.last_gossip_event = format!("subscribed to topic {topic}");
+                }
+                set_status(&state, "joined gossip topic; waiting for gossip neighbor");
+                update_send_controls(&state)?;
+                render_gossip_state(&state)?;
             }
-            return Err(JsValue::from_str("stream ended in a frame header"));
-        }
-        let len = u32::from_be_bytes([
-            self.buffer[0],
-            self.buffer[1],
-            self.buffer[2],
-            self.buffer[3],
-        ]) as usize;
-        if len > MAX_FRAME_BYTES {
-            return Err(JsValue::from_str("chat frame exceeds the demo limit"));
-        }
-        if !self.fill_until(4 + len).await? {
-            return Err(JsValue::from_str("stream ended in a frame body"));
-        }
-        self.buffer.drain(..4);
-        let payload: Vec<u8> = self.buffer.drain(..len).collect();
-        serde_json::from_slice(&payload)
-            .map(Some)
-            .map_err(|error| JsValue::from_str(&format!("failed to decode chat frame: {error}")))
-    }
-
-    async fn fill_until(&mut self, len: usize) -> Result<bool, JsValue> {
-        while self.buffer.len() < len {
-            if self.eof {
-                return Ok(false);
+            ChatGossipEvent::NeighborUp { endpoint } => {
+                {
+                    let mut state = state.borrow_mut();
+                    if !state.remote_names.iter().any(|peer| peer == &endpoint) {
+                        state.remote_names.push(endpoint.clone());
+                    }
+                    state.last_gossip_event = format!("neighbor up {endpoint}");
+                }
+                append_system(&state, &format!("neighbor connected: {endpoint}"));
+                update_send_controls(&state)?;
+                render_participants(&state)?;
+                render_gossip_state(&state)?;
             }
-            match self.stream.read_chunk().await? {
-                Some(chunk) => self.buffer.extend_from_slice(&chunk),
-                None => self.eof = true,
+            ChatGossipEvent::NeighborDown { endpoint } => {
+                {
+                    let mut state = state.borrow_mut();
+                    state
+                        .remote_names
+                        .retain(|candidate| candidate != &endpoint);
+                    state.last_gossip_event = format!("neighbor down {endpoint}");
+                }
+                append_system(&state, &format!("neighbor disconnected: {endpoint}"));
+                update_send_controls(&state)?;
+                render_participants(&state)?;
+                render_gossip_state(&state)?;
+            }
+            ChatGossipEvent::Chat {
+                from_endpoint,
+                from_name,
+                text,
+            } => {
+                if from_endpoint != state.borrow().local_endpoint {
+                    {
+                        let mut state = state.borrow_mut();
+                        state.messages_received += 1;
+                        state.last_gossip_event = format!("received chat from {from_endpoint}");
+                    }
+                    append_chat(&state, &from_endpoint, &from_name, &text);
+                    render_gossip_state(&state)?;
+                }
+            }
+            ChatGossipEvent::System { text } => {
+                {
+                    let mut state = state.borrow_mut();
+                    if text == "missed gossip messages" {
+                        state.lagged_events += 1;
+                    }
+                    state.last_gossip_event = text.clone();
+                }
+                append_system(&state, &text);
+                render_gossip_state(&state)?;
             }
         }
-        Ok(true)
     }
 }
 
-fn remove_peer(state: &Rc<RefCell<AppState>>, endpoint_id: &str) -> Result<(), JsValue> {
-    state
-        .borrow_mut()
-        .peers
-        .retain(|peer| peer.endpoint_id != endpoint_id);
-    render_participants(state)
-}
-
-fn render_participants(state: &Rc<RefCell<AppState>>) -> Result<(), JsValue> {
+fn render_participants(state: &Rc<RefCell<AppState>>) -> std::result::Result<(), JsValue> {
     let state = state.borrow();
     state.participants.set_text_content(None);
-    if let Some(RoomMode::Hosting) = state.mode {
-        let item = state.document.create_element("li")?;
-        item.set_class_name("badge badge-primary badge-outline");
-        item.set_text_content(Some(&format!("{} (host)", state.local_name)));
-        state.participants.append_child(&item)?;
-    } else if let Some(RoomMode::Joined) = state.mode {
+    if state.mode.is_some() {
         let item = state.document.create_element("li")?;
         item.set_class_name("badge badge-primary badge-outline");
         item.set_text_content(Some(&state.local_name));
         state.participants.append_child(&item)?;
     }
-    for name in &state.remote_names {
+    for peer in &state.remote_names {
         let item = state.document.create_element("li")?;
         item.set_class_name("badge badge-neutral badge-outline");
-        item.set_text_content(Some(name));
+        item.set_text_content(Some(peer));
         state.participants.append_child(&item)?;
     }
-    for peer in &state.peers {
-        let item = state.document.create_element("li")?;
-        item.set_class_name("badge badge-neutral badge-outline");
-        item.set_text_content(Some(&peer.name));
-        state.participants.append_child(&item)?;
+    Ok(())
+}
+
+fn update_send_controls(state: &Rc<RefCell<AppState>>) -> std::result::Result<(), JsValue> {
+    let state = state.borrow();
+    update_send_controls_from_state(&state)
+}
+
+fn update_send_controls_from_state(state: &AppState) -> std::result::Result<(), JsValue> {
+    let can_send = state.topic_joined && !state.remote_names.is_empty();
+    state.message_input.set_disabled(!can_send);
+    state.send_button.set_disabled(!can_send);
+
+    if can_send {
+        set_status_from_state(state, "gossip neighbor connected; messages will broadcast")?;
+    } else if state.mode.is_some() && state.topic_joined {
+        set_status_from_state(state, "waiting for a gossip neighbor before sending")?;
     }
+
+    Ok(())
+}
+
+fn render_gossip_state(state: &Rc<RefCell<AppState>>) -> std::result::Result<(), JsValue> {
+    let state = state.borrow();
+    state.gossip_state.set_text_content(None);
+
+    let mode = match state.mode {
+        Some(RoomMode::Hosting) => "hosting",
+        Some(RoomMode::Joined) => "joined",
+        None => "idle",
+    };
+    append_state_row(&state, "Mode", mode)?;
+    append_state_row(
+        &state,
+        "ALPN",
+        std::str::from_utf8(GOSSIP_ALPN).unwrap_or("gossip"),
+    )?;
+    append_state_row(&state, "Topic", &state.topic)?;
+    append_state_row(
+        &state,
+        "Seed",
+        state.seed_endpoint.as_deref().unwrap_or("none"),
+    )?;
+    append_state_row(&state, "Neighbors", &state.remote_names.len().to_string())?;
+    append_state_row(&state, "Sent", &state.messages_sent.to_string())?;
+    append_state_row(&state, "Received", &state.messages_received.to_string())?;
+    append_state_row(&state, "Lagged", &state.lagged_events.to_string())?;
+    append_state_row(&state, "Last", &state.last_gossip_event)?;
+    Ok(())
+}
+
+fn append_state_row(
+    state: &AppState,
+    label: &str,
+    value: &str,
+) -> std::result::Result<(), JsValue> {
+    let row = state.document.create_element("div")?;
+    row.set_class_name("grid grid-cols-[5rem_minmax(0,1fr)] gap-2");
+
+    let label_el = state.document.create_element("span")?;
+    label_el.set_class_name("text-xs font-semibold uppercase text-base-content/50");
+    label_el.set_text_content(Some(label));
+
+    let value_el = state.document.create_element("span")?;
+    value_el.set_class_name("endpoint min-w-0 font-mono text-xs text-base-content/85");
+    value_el.set_text_content(Some(value));
+
+    row.append_child(&label_el)?;
+    row.append_child(&value_el)?;
+    state.gossip_state.append_child(&row)?;
     Ok(())
 }
 
@@ -600,7 +788,7 @@ fn append_system(state: &Rc<RefCell<AppState>>, text: &str) {
     let _ = append_system_from_state(&state, text);
 }
 
-fn append_system_from_state(state: &AppState, text: &str) -> Result<(), JsValue> {
+fn append_system_from_state(state: &AppState, text: &str) -> std::result::Result<(), JsValue> {
     let message = state.document.create_element("div")?;
     message.set_class_name("alert alert-info alert-soft my-2 py-2 text-sm");
     message.set_text_content(Some(text));
@@ -616,7 +804,7 @@ fn set_status(state: &Rc<RefCell<AppState>>, text: &str) {
     let _ = set_status_from_state(&state, text);
 }
 
-fn set_status_from_state(state: &AppState, text: &str) -> Result<(), JsValue> {
+fn set_status_from_state(state: &AppState, text: &str) -> std::result::Result<(), JsValue> {
     state.status.set_text_content(Some(text));
     Ok(())
 }
@@ -630,13 +818,13 @@ fn display_name(input: &HtmlInputElement) -> String {
     }
 }
 
-fn document() -> Result<Document, JsValue> {
+fn document() -> std::result::Result<Document, JsValue> {
     web_sys::window()
         .and_then(|window| window.document())
         .ok_or_else(|| JsValue::from_str("browser document is unavailable"))
 }
 
-fn element<T: JsCast>(document: &Document, id: &str) -> Result<T, JsValue> {
+fn element<T: JsCast>(document: &Document, id: &str) -> std::result::Result<T, JsValue> {
     document
         .get_element_by_id(id)
         .ok_or_else(|| JsValue::from_str(&format!("missing #{id}")))?

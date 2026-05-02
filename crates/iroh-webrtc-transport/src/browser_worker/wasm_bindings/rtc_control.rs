@@ -197,6 +197,11 @@ fn schedule_main_rtc_timeout(
             bootstrap.clone(),
             &result,
         );
+        let _ = super::protocol_transport::complete_pending_protocol_transport_prepare_from_result(
+            core.clone(),
+            bootstrap.clone(),
+            &result,
+        );
         let _ = dispatch_main_rtc_commands_from_result(
             &core,
             &rtc_control,
@@ -268,6 +273,11 @@ fn apply_rtc_control_response(
         .map_err(|err| wire_error_to_js(err.wire_error()))?;
     super::bootstrap::send_outbound_signals_from_result(&bootstrap, &result)?;
     super::dial::complete_pending_dial_from_result(core.clone(), bootstrap.clone(), &result)?;
+    super::protocol_transport::complete_pending_protocol_transport_prepare_from_result(
+        core.clone(),
+        bootstrap.clone(),
+        &result,
+    )?;
     dispatch_main_rtc_commands_from_result(
         &core,
         &rtc_control,

@@ -24,6 +24,34 @@ pub(crate) const WORKER_ATTACH_DATA_CHANNEL_COMMAND: &str = "worker.attach-data-
 pub(crate) const WORKER_MAIN_RTC_RESULT_COMMAND: &str = "worker.main-rtc-result";
 pub(crate) const WORKER_CONNECTION_CLOSE_COMMAND: &str = "worker.connection-close";
 pub(crate) const WORKER_NODE_CLOSE_COMMAND: &str = "worker.node-close";
+#[cfg(any(
+    test,
+    all(
+        feature = "browser-main-thread",
+        target_family = "wasm",
+        target_os = "unknown"
+    ),
+    all(
+        feature = "browser-worker",
+        target_family = "wasm",
+        target_os = "unknown"
+    )
+))]
+pub(crate) const WORKER_PROTOCOL_COMMAND_COMMAND: &str = "worker.protocol-command";
+#[cfg(any(
+    test,
+    all(
+        feature = "browser-main-thread",
+        target_family = "wasm",
+        target_os = "unknown"
+    ),
+    all(
+        feature = "browser-worker",
+        target_family = "wasm",
+        target_os = "unknown"
+    )
+))]
+pub(crate) const WORKER_PROTOCOL_NEXT_EVENT_COMMAND: &str = "worker.protocol-next-event";
 
 pub(crate) const BENCHMARK_ECHO_OPEN_COMMAND: &str = "benchmark.echo-open";
 pub(crate) const BENCHMARK_LATENCY_COMMAND: &str = "benchmark.latency";

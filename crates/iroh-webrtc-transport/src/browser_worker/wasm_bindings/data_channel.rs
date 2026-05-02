@@ -262,6 +262,11 @@ fn apply_data_channel_event(
     let _ = super::bootstrap::send_outbound_signals_from_result(&bootstrap, &result);
     let _ =
         super::dial::complete_pending_dial_from_result(core.clone(), bootstrap.clone(), &result);
+    let _ = super::protocol_transport::complete_pending_protocol_transport_prepare_from_result(
+        core.clone(),
+        bootstrap.clone(),
+        &result,
+    );
     let _ = rtc_control::dispatch_main_rtc_commands_from_result(
         &core,
         &rtc_control,

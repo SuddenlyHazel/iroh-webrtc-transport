@@ -9,6 +9,7 @@ mod benchmark;
 mod bootstrap;
 mod data_channel;
 mod dial;
+mod protocol_transport;
 mod rtc_control;
 mod stream_binary;
 mod wire;
@@ -21,6 +22,7 @@ use bootstrap::{
     WorkerBootstrapRuntime, send_outbound_signals_from_result, start_bootstrap_accept_loop,
 };
 use dial::handle_dial_command_value;
+use protocol_transport::start_protocol_transport_prepare_loop;
 use rtc_control::{
     WorkerRtcControlPort, attach_rtc_control_port as attach_worker_rtc_control_port,
     detach_rtc_control_port, dispatch_main_rtc_commands_from_result,
@@ -39,12 +41,31 @@ struct WasmBrowserWorkerRuntime {
 }
 
 impl WasmBrowserWorkerRuntime {
-    fn new(post_message: Option<js_sys::Function>) -> Self {
+    fn new(
+        post_message: Option<js_sys::Function>,
+        worker_protocols: BrowserWorkerProtocolRegistry,
+    ) -> Self {
         crate::browser_console_tracing::install_worker_console_tracing();
+        let (protocol_transport_prepare_tx, protocol_transport_prepare_rx) = mpsc::channel(32);
+        let core = Rc::new(
+            BrowserWorkerRuntimeCore::new_with_protocols_and_transport_prepare(
+                worker_protocols,
+                protocol_transport_prepare_tx,
+            ),
+        );
+        let rtc_control = Rc::new(RefCell::new(None));
+        let bootstrap = Rc::new(WorkerBootstrapRuntime::new());
+        start_protocol_transport_prepare_loop(
+            core.clone(),
+            rtc_control.clone(),
+            bootstrap.clone(),
+            post_message.clone(),
+            protocol_transport_prepare_rx,
+        );
         Self {
-            core: Rc::new(BrowserWorkerRuntimeCore::new()),
-            rtc_control: Rc::new(RefCell::new(None)),
-            bootstrap: Rc::new(WorkerBootstrapRuntime::new()),
+            core,
+            rtc_control,
+            bootstrap,
             post_message,
         }
     }
@@ -191,7 +212,7 @@ pub(super) fn dispatch_main_rtc_commands_without_control_for_test(
     rtc_control::dispatch_main_rtc_commands_without_control_for_test(result)
 }
 
-pub use worker_host::start_browser_worker;
+pub use worker_host::{start_browser_worker, start_browser_worker_with_protocols};
 
 fn successful_worker_response_result_mut(
     response: &mut Value,

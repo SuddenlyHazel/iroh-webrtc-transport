@@ -16,7 +16,9 @@ use std::{
 
 use iroh::{
     Endpoint, EndpointAddr, EndpointId, SecretKey, TransportAddr,
+    address_lookup::memory::MemoryLookup,
     endpoint::{Connection, RecvStream, SendStream},
+    protocol::{AcceptError, DynProtocolHandler, ProtocolHandler, Router},
 };
 use iroh_base::CustomAddr;
 use serde_json::{Value, json};
@@ -49,7 +51,8 @@ pub(in crate::browser_worker) use crate::browser_protocol::{
     STREAM_RESET_COMMAND, STREAM_SEND_CHUNK_COMMAND, WORKER_ACCEPT_CLOSE_COMMAND,
     WORKER_ACCEPT_NEXT_COMMAND, WORKER_ACCEPT_OPEN_COMMAND, WORKER_ATTACH_DATA_CHANNEL_COMMAND,
     WORKER_BOOTSTRAP_SIGNAL_COMMAND, WORKER_CONNECTION_CLOSE_COMMAND, WORKER_DIAL_COMMAND,
-    WORKER_MAIN_RTC_RESULT_COMMAND, WORKER_NODE_CLOSE_COMMAND, WORKER_SPAWN_COMMAND,
+    WORKER_MAIN_RTC_RESULT_COMMAND, WORKER_NODE_CLOSE_COMMAND, WORKER_PROTOCOL_COMMAND_COMMAND,
+    WORKER_PROTOCOL_NEXT_EVENT_COMMAND, WORKER_SPAWN_COMMAND,
 };
 const DEFAULT_STREAM_RECEIVE_CHUNK_BYTES: usize = 64 * 1024;
 
@@ -57,6 +60,7 @@ mod error;
 mod main_rtc;
 mod node;
 mod protocol;
+mod protocol_registry;
 mod runtime;
 mod types;
 
@@ -74,6 +78,7 @@ pub(in crate::browser_worker) use main_rtc::{
 };
 pub(in crate::browser_worker) use node::BrowserWorkerNode;
 use protocol::*;
+pub use protocol_registry::BrowserWorkerProtocolRegistry;
 pub(in crate::browser_worker) use runtime::BrowserWorkerRuntimeCore;
 #[cfg(test)]
 pub(in crate::browser_worker) use types::BrowserWorkerNodeState;
@@ -83,12 +88,12 @@ pub(in crate::browser_worker) use types::{
     WorkerAttachDataChannelResult, WorkerBootstrapSignalInput, WorkerBootstrapSignalResult,
     WorkerCloseResult, WorkerConnectionKey, WorkerDataChannelAttachmentState,
     WorkerDataChannelSource, WorkerDialAllocation, WorkerDialStartResult, WorkerNodeKey,
-    WorkerProtocolConnectionInfo, WorkerResolvedTransport, WorkerSessionKey,
-    WorkerSessionLifecycle, WorkerSessionRole, WorkerSessionSnapshot, WorkerSpawnResult,
-    WorkerStreamAcceptResult, WorkerStreamBackpressureState, WorkerStreamCancelPendingResult,
-    WorkerStreamCloseSendResult, WorkerStreamKey, WorkerStreamOpenResult,
-    WorkerStreamReceiveResult, WorkerStreamResetResult, WorkerStreamSendResult,
-    WorkerTerminalDecision,
+    WorkerProtocolConnectionInfo, WorkerProtocolTransportPrepareRequest, WorkerResolvedTransport,
+    WorkerSessionKey, WorkerSessionLifecycle, WorkerSessionRole, WorkerSessionSnapshot,
+    WorkerSpawnResult, WorkerStreamAcceptResult, WorkerStreamBackpressureState,
+    WorkerStreamCancelPendingResult, WorkerStreamCloseSendResult, WorkerStreamKey,
+    WorkerStreamOpenResult, WorkerStreamReceiveResult, WorkerStreamResetResult,
+    WorkerStreamSendResult, WorkerTerminalDecision,
 };
 
 #[cfg(all(
@@ -102,7 +107,7 @@ mod wasm_bindings;
     target_family = "wasm",
     target_os = "unknown"
 ))]
-pub use wasm_bindings::start_browser_worker;
+pub use wasm_bindings::{start_browser_worker, start_browser_worker_with_protocols};
 
 #[cfg(test)]
 mod tests;

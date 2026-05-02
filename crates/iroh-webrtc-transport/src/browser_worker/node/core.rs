@@ -3,10 +3,15 @@ use iroh::endpoint::{AckFrequencyConfig, QuicTransportConfig, VarInt};
 use std::time::Duration;
 
 impl BrowserWorkerNode {
+    #[cfg(test)]
     pub(in crate::browser_worker) fn spawn(
         config: BrowserWorkerNodeConfig,
     ) -> BrowserWorkerResult<Self> {
-        Self::spawn_with_secret_key(config, SecretKey::generate())
+        Self::spawn_with_secret_key(
+            config,
+            SecretKey::generate(),
+            BrowserWorkerProtocolRegistry::default(),
+        )
     }
 
     #[cfg(test)]
@@ -17,8 +22,39 @@ impl BrowserWorkerNode {
     pub(in crate::browser_worker) fn spawn_with_secret_key(
         config: BrowserWorkerNodeConfig,
         secret_key: SecretKey,
+        worker_protocols: BrowserWorkerProtocolRegistry,
     ) -> BrowserWorkerResult<Self> {
         config.validate()?;
+        let facade_alpns = config
+            .facade_alpns
+            .iter()
+            .map(|alpn| validate_alpn(alpn.clone()))
+            .collect::<BrowserWorkerResult<Vec<_>>>()?;
+        let benchmark_echo_alpns = config
+            .benchmark_echo_alpns
+            .iter()
+            .map(|alpn| validate_alpn(alpn.clone()))
+            .collect::<BrowserWorkerResult<Vec<_>>>()?;
+        let mut seen_alpns = std::collections::HashSet::new();
+        for alpn in &facade_alpns {
+            if !seen_alpns.insert(alpn.clone())
+                || worker_protocols.contains_alpn(alpn)
+                || benchmark_echo_alpns.contains(alpn)
+            {
+                return Err(BrowserWorkerError::new(
+                    BrowserWorkerErrorCode::UnsupportedAlpn,
+                    format!("duplicate worker ALPN registration {alpn:?}"),
+                ));
+            }
+        }
+        for alpn in &benchmark_echo_alpns {
+            if !seen_alpns.insert(alpn.clone()) || worker_protocols.contains_alpn(alpn) {
+                return Err(BrowserWorkerError::new(
+                    BrowserWorkerErrorCode::UnsupportedAlpn,
+                    format!("duplicate worker ALPN registration {alpn:?}"),
+                ));
+            }
+        }
         let endpoint_id = secret_key.public();
         let local_custom_addr = config
             .transport_config
@@ -38,6 +74,10 @@ impl BrowserWorkerNode {
             BrowserWorkerError::new(BrowserWorkerErrorCode::SpawnFailed, err.to_string())
         })?;
 
+        let accepts = initial_accept_registrations(facade_alpns, config.accept_queue_capacity);
+        let protocol_transport_lookup =
+            MemoryLookup::with_provenance("iroh_webrtc_transport_protocol_sessions");
+
         Ok(Self {
             inner: Arc::new(Mutex::new(BrowserWorkerNodeInner {
                 secret_key,
@@ -46,20 +86,23 @@ impl BrowserWorkerNode {
                 local_custom_addr,
                 transport,
                 relay_endpoint: None,
-                relay_accept_abort: None,
+                relay_router: None,
                 webrtc_endpoint: None,
-                webrtc_accept_abort: None,
+                webrtc_router: None,
                 benchmark_echo_tasks: HashMap::new(),
                 bootstrap_connection_tx: None,
+                worker_protocols,
+                benchmark_echo_alpns,
+                worker_protocol_transport_intent: config.worker_protocol_transport_intent,
+                protocol_transport_lookup,
+                protocol_transport_prepare_tx: config.protocol_transport_prepare_tx,
                 dial_ids: DialIdGenerator::new(endpoint_id),
-                accept_queue_capacity: config.accept_queue_capacity,
                 session_config: config.session_config,
                 low_latency_quic_acks: config.low_latency_quic_acks,
                 sessions: HashMap::new(),
                 connections: HashMap::new(),
                 streams: HashMap::new(),
-                accepts: HashMap::new(),
-                next_accept_id: 1,
+                accepts,
                 next_connection_key: 1,
                 next_stream_key: 1,
                 closed: false,
@@ -140,7 +183,7 @@ impl BrowserWorkerNode {
     }
 
     pub(in crate::browser_worker) async fn start_endpoint(&self) -> BrowserWorkerResult<()> {
-        let (secret_key, transport, relay_alpns, webrtc_alpns, low_latency_quic_acks) = {
+        let (secret_key, transport, low_latency_quic_acks) = {
             let inner = self
                 .inner
                 .lock()
@@ -154,15 +197,22 @@ impl BrowserWorkerNode {
             (
                 inner.secret_key.clone(),
                 inner.transport.clone(),
-                inner.relay_endpoint_alpns(),
-                inner.webrtc_endpoint_alpns(),
                 inner.low_latency_quic_acks,
             )
         };
 
-        let mut relay_builder = Endpoint::builder(iroh::endpoint::presets::N0)
-            .secret_key(secret_key.clone())
-            .alpns(relay_alpns);
+        let (protocol_transport_lookup, protocol_transport_hook) = {
+            let inner = self
+                .inner
+                .lock()
+                .expect("browser worker node mutex poisoned");
+            (
+                inner.protocol_transport_lookup.clone(),
+                self.protocol_transport_hook(),
+            )
+        };
+        let mut relay_builder =
+            Endpoint::builder(iroh::endpoint::presets::N0).secret_key(secret_key.clone());
         if low_latency_quic_acks {
             tracing::debug!(
                 target: "iroh_webrtc_transport::browser_worker::node",
@@ -177,11 +227,16 @@ impl BrowserWorkerNode {
                 format!("failed to bind worker relay Iroh endpoint: {err}"),
             )
         })?;
-        let webrtc_endpoint =
-            bind_webrtc_endpoint(secret_key, webrtc_alpns, transport, low_latency_quic_acks)
-                .await?;
-        let relay_accept_abort = self.spawn_relay_endpoint_accept_loop(relay_endpoint.clone());
-        let webrtc_accept_abort = self.spawn_webrtc_endpoint_accept_loop(webrtc_endpoint.clone());
+        let webrtc_endpoint = bind_webrtc_endpoint(
+            secret_key,
+            transport,
+            low_latency_quic_acks,
+            Some(protocol_transport_lookup),
+            Some(protocol_transport_hook),
+        )
+        .await?;
+        let (relay_router, webrtc_router) =
+            self.build_endpoint_routers(relay_endpoint.clone(), webrtc_endpoint.clone())?;
 
         let mut close_endpoints = false;
         {
@@ -191,13 +246,11 @@ impl BrowserWorkerNode {
                 .expect("browser worker node mutex poisoned");
             if inner.closed || inner.relay_endpoint.is_some() || inner.webrtc_endpoint.is_some() {
                 close_endpoints = true;
-                relay_accept_abort.abort();
-                webrtc_accept_abort.abort();
             } else {
                 inner.relay_endpoint = Some(relay_endpoint.clone());
-                inner.relay_accept_abort = Some(relay_accept_abort);
+                inner.relay_router = Some(relay_router);
                 inner.webrtc_endpoint = Some(webrtc_endpoint.clone());
-                inner.webrtc_accept_abort = Some(webrtc_accept_abort);
+                inner.webrtc_router = Some(webrtc_router);
             }
         }
         if close_endpoints {
@@ -211,7 +264,7 @@ impl BrowserWorkerNode {
     pub(in crate::browser_worker) async fn restart_webrtc_endpoint(
         &self,
     ) -> BrowserWorkerResult<Endpoint> {
-        let (secret_key, transport, webrtc_alpns, low_latency_quic_acks, old_endpoint) = {
+        let (secret_key, transport, low_latency_quic_acks, old_endpoint, old_router) = {
             let mut inner = self
                 .inner
                 .lock()
@@ -219,26 +272,41 @@ impl BrowserWorkerNode {
             if inner.closed {
                 return Err(BrowserWorkerError::closed());
             }
-            if let Some(abort) = inner.webrtc_accept_abort.take() {
-                abort.abort();
-            }
             (
                 inner.secret_key.clone(),
                 inner.transport.clone(),
-                inner.webrtc_endpoint_alpns(),
                 inner.low_latency_quic_acks,
                 inner.webrtc_endpoint.take(),
+                inner.webrtc_router.take(),
             )
         };
 
+        if let Some(router) = old_router {
+            let _ = router.shutdown().await;
+        }
         if let Some(endpoint) = old_endpoint {
             endpoint.close().await;
         }
 
-        let endpoint =
-            bind_webrtc_endpoint(secret_key, webrtc_alpns, transport, low_latency_quic_acks)
-                .await?;
-        let accept_abort = self.spawn_webrtc_endpoint_accept_loop(endpoint.clone());
+        let (protocol_transport_lookup, protocol_transport_hook) = {
+            let inner = self
+                .inner
+                .lock()
+                .expect("browser worker node mutex poisoned");
+            (
+                inner.protocol_transport_lookup.clone(),
+                self.protocol_transport_hook(),
+            )
+        };
+        let endpoint = bind_webrtc_endpoint(
+            secret_key,
+            transport,
+            low_latency_quic_acks,
+            Some(protocol_transport_lookup),
+            Some(protocol_transport_hook),
+        )
+        .await?;
+        let mut router = Some(self.build_webrtc_router(endpoint.clone())?);
 
         let mut close_endpoint = false;
         {
@@ -248,14 +316,16 @@ impl BrowserWorkerNode {
                 .expect("browser worker node mutex poisoned");
             if inner.closed {
                 close_endpoint = true;
-                accept_abort.abort();
             } else {
                 inner.webrtc_endpoint = Some(endpoint.clone());
-                inner.webrtc_accept_abort = Some(accept_abort);
+                inner.webrtc_router = router.take();
             }
         }
         if close_endpoint {
             endpoint.close().await;
+            if let Some(router) = router {
+                let _ = router.shutdown().await;
+            }
             return Err(BrowserWorkerError::closed());
         }
         Ok(endpoint)
@@ -336,12 +406,8 @@ impl BrowserWorkerNode {
             }
         }
         inner.streams.clear();
-        if let Some(abort) = inner.relay_accept_abort.take() {
-            abort.abort();
-        }
-        if let Some(abort) = inner.webrtc_accept_abort.take() {
-            abort.abort();
-        }
+        let relay_router = inner.relay_router.take();
+        let webrtc_router = inner.webrtc_router.take();
         for (_, abort) in inner.benchmark_echo_tasks.drain() {
             abort.abort();
         }
@@ -355,141 +421,17 @@ impl BrowserWorkerNode {
                 endpoint.close().await;
             });
         }
+        if let Some(router) = relay_router {
+            n0_future::task::spawn(async move {
+                let _ = router.shutdown().await;
+            });
+        }
+        if let Some(router) = webrtc_router {
+            n0_future::task::spawn(async move {
+                let _ = router.shutdown().await;
+            });
+        }
         (true, outbound_signals)
-    }
-
-    fn spawn_relay_endpoint_accept_loop(&self, endpoint: Endpoint) -> n0_future::task::AbortHandle {
-        let node = self.clone();
-        let handle = n0_future::task::spawn(async move {
-            node.run_relay_endpoint_accept_loop(endpoint).await;
-        });
-        handle.abort_handle()
-    }
-
-    fn spawn_webrtc_endpoint_accept_loop(
-        &self,
-        endpoint: Endpoint,
-    ) -> n0_future::task::AbortHandle {
-        let node = self.clone();
-        let handle = n0_future::task::spawn(async move {
-            node.run_webrtc_endpoint_accept_loop(endpoint).await;
-        });
-        handle.abort_handle()
-    }
-
-    async fn run_relay_endpoint_accept_loop(&self, endpoint: Endpoint) {
-        loop {
-            let Some(incoming) = endpoint.accept().await else {
-                tracing::debug!(
-                    target: "iroh_webrtc_transport::browser_worker::connection",
-                    "relay endpoint accept loop ended"
-                );
-                return;
-            };
-            tracing::trace!(
-                target: "iroh_webrtc_transport::browser_worker::connection",
-                "endpoint accepted incoming handshake"
-            );
-            let connection = match incoming.await {
-                Ok(connection) => connection,
-                Err(err) => {
-                    tracing::debug!(
-                        target: "iroh_webrtc_transport::browser_worker::connection",
-                        %err,
-                        "incoming handshake failed"
-                    );
-                    continue;
-                }
-            };
-            let alpn = String::from_utf8_lossy(connection.alpn()).to_string();
-            tracing::trace!(
-                target: "iroh_webrtc_transport::browser_worker::connection",
-                remote = %connection.remote_id(),
-                alpn = %alpn,
-                "accepted Iroh connection"
-            );
-            trace_iroh_connection_paths("accepted relay endpoint handshake", None, &connection);
-            if alpn == bootstrap_alpn_str() {
-                if let Some(sender) = self.bootstrap_connection_sender() {
-                    if sender.send(connection).is_err() {
-                        // The Wasm bootstrap driver is gone; close the relay
-                        // bootstrap connection instead of leaving it pending.
-                    }
-                } else {
-                    connection.close(0u32.into(), b"bootstrap loop not attached");
-                }
-                continue;
-            }
-            if self
-                .admit_iroh_application_connection(
-                    connection,
-                    WorkerResolvedTransport::IrohRelay,
-                    None,
-                    true,
-                )
-                .is_err()
-            {
-                // The ALPN may have been closed after the endpoint accepted the handshake.
-                // Closing the connection keeps the worker's accept gate authoritative.
-            }
-        }
-    }
-
-    async fn run_webrtc_endpoint_accept_loop(&self, endpoint: Endpoint) {
-        loop {
-            let Some(incoming) = endpoint.accept().await else {
-                tracing::debug!(
-                    target: "iroh_webrtc_transport::browser_worker::connection",
-                    "WebRTC endpoint accept loop ended"
-                );
-                return;
-            };
-            tracing::trace!(
-                target: "iroh_webrtc_transport::browser_worker::connection",
-                "WebRTC endpoint accepted incoming handshake"
-            );
-            let connection = match incoming.await {
-                Ok(connection) => connection,
-                Err(err) => {
-                    tracing::debug!(
-                        target: "iroh_webrtc_transport::browser_worker::connection",
-                        %err,
-                        "incoming WebRTC endpoint handshake failed"
-                    );
-                    continue;
-                }
-            };
-            let alpn = String::from_utf8_lossy(connection.alpn()).to_string();
-            tracing::trace!(
-                target: "iroh_webrtc_transport::browser_worker::connection",
-                remote = %connection.remote_id(),
-                alpn = %alpn,
-                "accepted WebRTC endpoint Iroh connection"
-            );
-            trace_iroh_connection_paths("accepted WebRTC endpoint handshake", None, &connection);
-            if alpn == bootstrap_alpn_str() {
-                connection.close(
-                    0u32.into(),
-                    b"bootstrap is not accepted on WebRTC app endpoint",
-                );
-                continue;
-            }
-            let (transport, session_key) =
-                self.incoming_application_route(connection.remote_id(), &alpn);
-            if transport != WorkerResolvedTransport::WebRtc {
-                connection.close(
-                    0u32.into(),
-                    b"custom app connection did not match WebRTC session",
-                );
-                continue;
-            }
-            if self
-                .admit_iroh_application_connection(connection, transport, session_key, true)
-                .is_err()
-            {
-                // The ALPN/session may have been closed after the endpoint accepted the handshake.
-            }
-        }
     }
 
     pub(in crate::browser_worker) async fn dial_iroh_application_connection(
@@ -642,19 +584,215 @@ impl BrowserWorkerNode {
             )
         })
     }
+
+    #[cfg(test)]
+    pub(in crate::browser_worker) fn webrtc_endpoint(&self) -> BrowserWorkerResult<Endpoint> {
+        let inner = self
+            .inner
+            .lock()
+            .expect("browser worker node mutex poisoned");
+        if inner.closed {
+            return Err(BrowserWorkerError::closed());
+        }
+        inner.webrtc_endpoint.clone().ok_or_else(|| {
+            BrowserWorkerError::new(
+                BrowserWorkerErrorCode::SpawnFailed,
+                "worker WebRTC endpoint has not been started",
+            )
+        })
+    }
+
+    fn build_endpoint_routers(
+        &self,
+        relay_endpoint: Endpoint,
+        webrtc_endpoint: Endpoint,
+    ) -> BrowserWorkerResult<(Router, Router)> {
+        let mut relay_router = Router::builder(relay_endpoint).accept(
+            WEBRTC_BOOTSTRAP_ALPN,
+            WorkerBootstrapHandler { node: self.clone() },
+        );
+        let (facade_alpns, worker_protocols) = {
+            let inner = self
+                .inner
+                .lock()
+                .expect("browser worker node mutex poisoned");
+            (
+                inner.accepts.keys().cloned().collect::<Vec<_>>(),
+                inner.worker_protocols.clone(),
+            )
+        };
+
+        for alpn in facade_alpns {
+            relay_router = relay_router.accept(
+                alpn.as_bytes(),
+                WorkerRelayFacadeHandler { node: self.clone() },
+            );
+        }
+
+        let benchmark_echo_alpns = {
+            let inner = self
+                .inner
+                .lock()
+                .expect("browser worker node mutex poisoned");
+            inner.benchmark_echo_alpns.clone()
+        };
+        for alpn in &benchmark_echo_alpns {
+            relay_router = relay_router.accept(
+                alpn.as_bytes(),
+                WorkerBenchmarkEchoHandler {
+                    node: self.clone(),
+                    transport: WorkerResolvedTransport::IrohRelay,
+                },
+            );
+        }
+
+        let worker_protocol_transport_intent = {
+            let inner = self
+                .inner
+                .lock()
+                .expect("browser worker node mutex poisoned");
+            inner.worker_protocol_transport_intent
+        };
+        if !worker_protocol_transport_intent.uses_webrtc() {
+            for alpn in worker_protocols.alpns() {
+                let relay_handler = worker_protocols
+                    .handler(alpn, relay_router.endpoint().clone())
+                    .ok_or_else(|| {
+                        BrowserWorkerError::new(
+                            BrowserWorkerErrorCode::UnsupportedAlpn,
+                            format!("missing worker protocol handler for ALPN {alpn:?}"),
+                        )
+                    })?;
+                relay_router = relay_router.accept(alpn.as_bytes(), relay_handler);
+            }
+        }
+
+        Ok((
+            relay_router.spawn(),
+            self.build_webrtc_router(webrtc_endpoint)?,
+        ))
+    }
+
+    fn build_webrtc_router(&self, webrtc_endpoint: Endpoint) -> BrowserWorkerResult<Router> {
+        let (facade_alpns, benchmark_echo_alpns, worker_protocols, worker_protocol_transport_intent) = {
+            let inner = self
+                .inner
+                .lock()
+                .expect("browser worker node mutex poisoned");
+            (
+                inner.accepts.keys().cloned().collect::<Vec<_>>(),
+                inner.benchmark_echo_alpns.clone(),
+                inner.worker_protocols.clone(),
+                inner.worker_protocol_transport_intent,
+            )
+        };
+
+        let mut webrtc_router = Router::builder(webrtc_endpoint);
+
+        for alpn in facade_alpns {
+            webrtc_router = webrtc_router.accept(
+                alpn.as_bytes(),
+                WorkerWebRtcFacadeHandler { node: self.clone() },
+            );
+        }
+
+        for alpn in benchmark_echo_alpns {
+            webrtc_router = webrtc_router.accept(
+                alpn.as_bytes(),
+                WorkerBenchmarkEchoHandler {
+                    node: self.clone(),
+                    transport: WorkerResolvedTransport::WebRtc,
+                },
+            );
+        }
+
+        if worker_protocol_transport_intent.uses_webrtc() {
+            for alpn in worker_protocols.alpns() {
+                let webrtc_handler = worker_protocols
+                    .handler(alpn, webrtc_router.endpoint().clone())
+                    .ok_or_else(|| {
+                        BrowserWorkerError::new(
+                            BrowserWorkerErrorCode::UnsupportedAlpn,
+                            format!("missing worker protocol handler for ALPN {alpn:?}"),
+                        )
+                    })?;
+                webrtc_router = webrtc_router.accept(
+                    alpn.as_bytes(),
+                    WorkerWebRtcProtocolGate::new(self.clone(), webrtc_handler),
+                );
+            }
+        }
+
+        Ok(webrtc_router.spawn())
+    }
+
+    fn accept_webrtc_connection(
+        &self,
+        connection: &Connection,
+    ) -> BrowserWorkerResult<Option<WorkerSessionKey>> {
+        let remote = connection.remote_id();
+        let alpn = String::from_utf8_lossy(connection.alpn()).to_string();
+        let mut inner = self
+            .inner
+            .lock()
+            .expect("browser worker node mutex poisoned");
+        if inner.closed {
+            return Err(BrowserWorkerError::closed());
+        }
+        let Some((session_key, remote, dial_id)) =
+            inner.sessions.values_mut().find_map(|session| {
+                if session.role == WorkerSessionRole::Acceptor
+                    && session.remote == remote
+                    && session.alpn == alpn
+                    && session.transport_intent.uses_webrtc()
+                    && session.resolved_transport.is_none()
+                    && session.channel_attachment == WorkerDataChannelAttachmentState::Open
+                    && matches!(
+                        session.lifecycle,
+                        WorkerSessionLifecycle::WebRtcNegotiating
+                            | WorkerSessionLifecycle::ApplicationReady
+                    )
+                {
+                    Some((session.session_key.clone(), session.remote, session.dial_id))
+                } else {
+                    None
+                }
+            })
+        else {
+            return Err(BrowserWorkerError::new(
+                BrowserWorkerErrorCode::WebRtcFailed,
+                "custom app connection did not match WebRTC session",
+            ));
+        };
+        require_webrtc_selected_path(connection, remote, dial_id)?;
+        let session = inner
+            .sessions
+            .get_mut(&session_key)
+            .expect("session was selected above");
+        validate_transport_resolution(session, WorkerResolvedTransport::WebRtc)?;
+        session.resolve_transport(WorkerResolvedTransport::WebRtc)?;
+        inner.refresh_webrtc_transport_addrs();
+        Ok(Some(session_key))
+    }
 }
 
 async fn bind_webrtc_endpoint(
     secret_key: SecretKey,
-    alpns: Vec<Vec<u8>>,
     transport: WebRtcTransport,
     low_latency_quic_acks: bool,
+    protocol_transport_lookup: Option<MemoryLookup>,
+    protocol_transport_hook: Option<protocol_transport::WorkerProtocolTransportHook>,
 ) -> BrowserWorkerResult<Endpoint> {
     let mut builder = Endpoint::builder(iroh::endpoint::presets::Minimal)
         .secret_key(secret_key)
-        .alpns(alpns)
         .clear_relay_transports()
         .clear_address_lookup();
+    if let Some(lookup) = protocol_transport_lookup {
+        builder = builder.address_lookup(lookup);
+    }
+    if let Some(hook) = protocol_transport_hook {
+        builder = builder.hooks(hook);
+    }
     #[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
     {
         builder = builder.clear_ip_transports();
@@ -671,6 +809,188 @@ async fn bind_webrtc_endpoint(
                 format!("failed to bind worker WebRTC app Iroh endpoint: {err}"),
             )
         })
+}
+
+fn initial_accept_registrations(
+    alpns: Vec<String>,
+    capacity: usize,
+) -> HashMap<String, AcceptRegistrationState> {
+    let mut next_accept_id = 1;
+    let mut accepts = HashMap::new();
+    for alpn in alpns {
+        let id = WorkerAcceptId(next_accept_id);
+        next_accept_id = next_accept_id
+            .checked_add(1)
+            .expect("worker accept id exhausted");
+        accepts.insert(
+            alpn.clone(),
+            AcceptRegistrationState::new(id, alpn, capacity),
+        );
+    }
+    accepts
+}
+
+fn accept_error(error: BrowserWorkerError) -> AcceptError {
+    AcceptError::from_err(std::io::Error::new(
+        std::io::ErrorKind::Other,
+        error.to_string(),
+    ))
+}
+
+#[derive(Debug, Clone)]
+struct WorkerBootstrapHandler {
+    node: BrowserWorkerNode,
+}
+
+impl ProtocolHandler for WorkerBootstrapHandler {
+    async fn accept(&self, connection: Connection) -> std::result::Result<(), AcceptError> {
+        if let Some(sender) = self.node.bootstrap_connection_sender() {
+            sender.send(connection).map_err(|_| {
+                AcceptError::from_err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "worker bootstrap loop not attached",
+                ))
+            })
+        } else {
+            connection.close(0u32.into(), b"bootstrap loop not attached");
+            Err(AcceptError::from_err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "worker bootstrap loop not attached",
+            )))
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct WorkerRelayFacadeHandler {
+    node: BrowserWorkerNode,
+}
+
+impl ProtocolHandler for WorkerRelayFacadeHandler {
+    async fn accept(&self, connection: Connection) -> std::result::Result<(), AcceptError> {
+        self.node
+            .admit_iroh_application_connection(
+                connection,
+                WorkerResolvedTransport::IrohRelay,
+                None,
+                true,
+            )
+            .map(|_| ())
+            .map_err(accept_error)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct WorkerWebRtcFacadeHandler {
+    node: BrowserWorkerNode,
+}
+
+impl ProtocolHandler for WorkerWebRtcFacadeHandler {
+    async fn accept(&self, connection: Connection) -> std::result::Result<(), AcceptError> {
+        let session_key = self
+            .node
+            .accept_webrtc_connection(&connection)
+            .map_err(|err| {
+                connection.close(
+                    0u32.into(),
+                    b"custom app connection did not match WebRTC session",
+                );
+                accept_error(err)
+            })?;
+        self.node
+            .admit_iroh_application_connection(
+                connection,
+                WorkerResolvedTransport::WebRtc,
+                session_key,
+                true,
+            )
+            .map(|_| ())
+            .map_err(accept_error)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct WorkerBenchmarkEchoHandler {
+    node: BrowserWorkerNode,
+    transport: WorkerResolvedTransport,
+}
+
+impl ProtocolHandler for WorkerBenchmarkEchoHandler {
+    async fn accept(&self, connection: Connection) -> std::result::Result<(), AcceptError> {
+        let session_key = if self.transport == WorkerResolvedTransport::WebRtc {
+            self.node
+                .accept_webrtc_connection(&connection)
+                .map_err(|err| {
+                    connection.close(
+                        0u32.into(),
+                        b"custom app connection did not match WebRTC session",
+                    );
+                    accept_error(err)
+                })?
+        } else {
+            None
+        };
+        let (connection_key, _) = self
+            .node
+            .admit_iroh_application_connection_with_key(
+                connection,
+                self.transport,
+                session_key,
+                false,
+            )
+            .map_err(accept_error)?;
+        let node = self.node.clone();
+        n0_future::task::spawn(async move {
+            if let Err(err) = node.run_benchmark_echo_connection(connection_key).await {
+                tracing::debug!(
+                    target: "iroh_webrtc_transport::browser_worker::benchmark",
+                    connection_key = connection_key.0,
+                    %err,
+                    "benchmark echo connection failed"
+                );
+            }
+        });
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct WorkerWebRtcProtocolGate {
+    node: BrowserWorkerNode,
+    handler: Box<dyn DynProtocolHandler>,
+}
+
+impl WorkerWebRtcProtocolGate {
+    fn new(node: BrowserWorkerNode, handler: Box<dyn DynProtocolHandler>) -> Self {
+        Self { node, handler }
+    }
+}
+
+impl ProtocolHandler for WorkerWebRtcProtocolGate {
+    async fn on_accepting(
+        &self,
+        accepting: iroh::endpoint::Accepting,
+    ) -> std::result::Result<Connection, AcceptError> {
+        let connection = self.handler.on_accepting(accepting).await?;
+        self.node
+            .accept_webrtc_connection(&connection)
+            .map_err(|err| {
+                connection.close(
+                    0u32.into(),
+                    b"custom app connection did not match WebRTC session",
+                );
+                accept_error(err)
+            })?;
+        Ok(connection)
+    }
+
+    async fn accept(&self, connection: Connection) -> std::result::Result<(), AcceptError> {
+        self.handler.accept(connection).await
+    }
+
+    async fn shutdown(&self) {
+        self.handler.shutdown().await;
+    }
 }
 
 fn low_latency_ack_transport_config() -> QuicTransportConfig {

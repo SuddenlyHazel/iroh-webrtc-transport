@@ -37,10 +37,10 @@ impl BrowserWorkerNode {
                             "bootstrap dial request is missing application ALPN",
                         )
                     })?;
-                if !self.is_alpn_registered(&alpn) {
+                if !self.is_application_alpn_registered(&alpn) {
                     return Err(BrowserWorkerError::new(
                         BrowserWorkerErrorCode::UnsupportedAlpn,
-                        format!("no active accept registration for ALPN {alpn:?}"),
+                        format!("no registered application handler for ALPN {alpn:?}"),
                     ));
                 }
                 let session = self.allocate_accept_session(

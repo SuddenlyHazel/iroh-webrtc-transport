@@ -10,6 +10,7 @@ use super::wire::{
     js_context_error, js_error_message, js_number_property, js_optional_string_property,
     js_required_function_property,
 };
+use crate::browser_worker::BrowserWorkerProtocolRegistry;
 
 thread_local! {
     static WORKER_HOST: RefCell<Option<BrowserWorkerHost>> = const { RefCell::new(None) };
@@ -23,6 +24,12 @@ struct BrowserWorkerHost {
 
 #[wasm_bindgen]
 pub fn start_browser_worker() -> Result<(), JsValue> {
+    start_browser_worker_with_protocols(BrowserWorkerProtocolRegistry::default())
+}
+
+pub fn start_browser_worker_with_protocols(
+    worker_protocols: BrowserWorkerProtocolRegistry,
+) -> Result<(), JsValue> {
     WORKER_HOST.with(|host| {
         if host.borrow().is_some() {
             return Ok(());
@@ -32,12 +39,15 @@ pub fn start_browser_worker() -> Result<(), JsValue> {
             let _ = post_worker_message(&message, &transfer);
         }) as Box<dyn FnMut(_, _)>);
 
-        let runtime = Rc::new(WasmBrowserWorkerRuntime::new(Some(
-            post_message
-                .as_ref()
-                .unchecked_ref::<js_sys::Function>()
-                .clone(),
-        )));
+        let runtime = Rc::new(WasmBrowserWorkerRuntime::new(
+            Some(
+                post_message
+                    .as_ref()
+                    .unchecked_ref::<js_sys::Function>()
+                    .clone(),
+            ),
+            worker_protocols,
+        ));
 
         let handler_runtime = runtime.clone();
         let message_handler = Closure::wrap(Box::new(move |event: MessageEvent| {

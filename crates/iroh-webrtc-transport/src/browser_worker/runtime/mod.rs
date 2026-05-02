@@ -5,12 +5,28 @@ mod dispatcher;
 #[derive(Default)]
 pub(in crate::browser_worker) struct BrowserWorkerRuntimeCore {
     node: RefCell<Option<BrowserWorkerNode>>,
+    worker_protocols: BrowserWorkerProtocolRegistry,
+    protocol_transport_prepare_tx: Option<mpsc::Sender<WorkerProtocolTransportPrepareRequest>>,
     spawn_lock: tokio::sync::Mutex<()>,
 }
 
 impl BrowserWorkerRuntimeCore {
+    #[cfg(test)]
     pub(in crate::browser_worker) fn new() -> Self {
         Self::default()
+    }
+
+    #[cfg(all(target_family = "wasm", target_os = "unknown"))]
+    pub(in crate::browser_worker) fn new_with_protocols_and_transport_prepare(
+        worker_protocols: BrowserWorkerProtocolRegistry,
+        protocol_transport_prepare_tx: mpsc::Sender<WorkerProtocolTransportPrepareRequest>,
+    ) -> Self {
+        Self {
+            node: RefCell::new(None),
+            worker_protocols,
+            protocol_transport_prepare_tx: Some(protocol_transport_prepare_tx),
+            spawn_lock: tokio::sync::Mutex::new(()),
+        }
     }
 
     pub(in crate::browser_worker) fn node(&self) -> Option<BrowserWorkerNode> {
@@ -36,7 +52,7 @@ impl BrowserWorkerRuntimeCore {
 
     pub(super) async fn spawn_node(
         &self,
-        config: BrowserWorkerNodeConfig,
+        mut config: BrowserWorkerNodeConfig,
         bootstrap_connection_tx: Option<mpsc::UnboundedSender<Connection>>,
     ) -> BrowserWorkerResult<WorkerSpawnResult> {
         let _spawn_guard = self.spawn_lock.lock().await;
@@ -46,7 +62,14 @@ impl BrowserWorkerRuntimeCore {
             }
             return Ok(node.spawn_result());
         }
-        let node = BrowserWorkerNode::spawn(config)?;
+        if config.protocol_transport_prepare_tx.is_none() {
+            config.protocol_transport_prepare_tx = self.protocol_transport_prepare_tx.clone();
+        }
+        let node = BrowserWorkerNode::spawn_with_secret_key(
+            config,
+            SecretKey::generate(),
+            self.worker_protocols.clone(),
+        )?;
         if bootstrap_connection_tx.is_some() {
             node.set_bootstrap_connection_sender(bootstrap_connection_tx)?;
         }

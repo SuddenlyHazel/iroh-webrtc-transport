@@ -92,6 +92,14 @@ impl BrowserWorkerRuntimeCore {
                 };
                 to_protocol_value(result)
             }
+            WorkerCommand::ProtocolCommand { alpn, command } => {
+                let _ = self.open_node()?;
+                self.worker_protocols.handle_command(&alpn, command).await
+            }
+            WorkerCommand::ProtocolNextEvent { alpn } => {
+                let _ = self.open_node()?;
+                self.worker_protocols.next_event(&alpn).await
+            }
             WorkerCommand::StreamOpenBi { connection_key } => {
                 let node = self.open_node()?;
                 to_protocol_value(node.open_bi(connection_key).await?)

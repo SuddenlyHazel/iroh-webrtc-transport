@@ -43,25 +43,17 @@ impl BrowserWorkerNode {
             if inner.closed {
                 return Err(BrowserWorkerError::closed());
             }
-            if inner.benchmark_echo_tasks.contains_key(&alpn) {
-                return Ok(WorkerBenchmarkEchoOpenResult {
-                    opened: false,
-                    alpn,
-                });
+            if !inner.benchmark_echo_alpns.contains(&alpn) {
+                return Err(BrowserWorkerError::new(
+                    BrowserWorkerErrorCode::UnsupportedAlpn,
+                    format!("ALPN {alpn:?} was not registered as a benchmark echo protocol"),
+                ));
             }
         }
-
-        let registration = self.accept_open(alpn.clone())?;
-        let node = self.clone();
-        let handle = n0_future::task::spawn(async move {
-            node.run_benchmark_echo_accept_loop(registration.id).await;
-        });
-        self.inner
-            .lock()
-            .expect("browser worker node mutex poisoned")
-            .benchmark_echo_tasks
-            .insert(alpn.clone(), handle.abort_handle());
-        Ok(WorkerBenchmarkEchoOpenResult { opened: true, alpn })
+        Ok(WorkerBenchmarkEchoOpenResult {
+            opened: false,
+            alpn,
+        })
     }
 
     pub(in crate::browser_worker) async fn benchmark_latency_on_connection(
@@ -360,44 +352,7 @@ impl BrowserWorkerNode {
         })
     }
 
-    async fn run_benchmark_echo_accept_loop(&self, accept_id: WorkerAcceptId) {
-        loop {
-            let connection = match self.accept_next(accept_id).await {
-                Ok(WorkerAcceptNext::Ready(connection)) => connection,
-                Ok(WorkerAcceptNext::Done) => return,
-                Err(err) => {
-                    tracing::debug!(
-                        target: "iroh_webrtc_transport::browser_worker::benchmark",
-                        %err,
-                        "benchmark echo accept loop failed"
-                    );
-                    return;
-                }
-            };
-            tracing::trace!(
-                target: "iroh_webrtc_transport::browser_worker::benchmark",
-                worker_now_ms = benchmark_now_ms(),
-                connection_key = connection.key.0,
-                remote = %connection.remote,
-                alpn = %connection.alpn,
-                transport = ?connection.transport,
-                "benchmark echo accepted connection"
-            );
-            let node = self.clone();
-            n0_future::task::spawn(async move {
-                if let Err(err) = node.run_benchmark_echo_connection(connection.key).await {
-                    tracing::debug!(
-                        target: "iroh_webrtc_transport::browser_worker::benchmark",
-                        connection_key = connection.key.0,
-                        %err,
-                        "benchmark echo connection failed"
-                    );
-                }
-            });
-        }
-    }
-
-    async fn run_benchmark_echo_connection(
+    pub(super) async fn run_benchmark_echo_connection(
         &self,
         connection_key: WorkerConnectionKey,
     ) -> BrowserWorkerResult<()> {

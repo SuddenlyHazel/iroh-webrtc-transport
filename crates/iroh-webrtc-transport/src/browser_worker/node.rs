@@ -8,6 +8,12 @@ pub(in crate::browser_worker) struct BrowserWorkerNode {
     inner: Arc<Mutex<BrowserWorkerNodeInner>>,
 }
 
+impl std::fmt::Debug for BrowserWorkerNode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BrowserWorkerNode").finish_non_exhaustive()
+    }
+}
+
 struct BrowserWorkerNodeInner {
     secret_key: SecretKey,
     node_key: WorkerNodeKey,
@@ -15,20 +21,23 @@ struct BrowserWorkerNodeInner {
     local_custom_addr: CustomAddr,
     transport: WebRtcTransport,
     relay_endpoint: Option<Endpoint>,
-    relay_accept_abort: Option<n0_future::task::AbortHandle>,
+    relay_router: Option<Router>,
     webrtc_endpoint: Option<Endpoint>,
-    webrtc_accept_abort: Option<n0_future::task::AbortHandle>,
+    webrtc_router: Option<Router>,
     benchmark_echo_tasks: HashMap<String, n0_future::task::AbortHandle>,
     bootstrap_connection_tx: Option<mpsc::UnboundedSender<Connection>>,
+    worker_protocols: BrowserWorkerProtocolRegistry,
+    benchmark_echo_alpns: Vec<String>,
+    worker_protocol_transport_intent: BootstrapTransportIntent,
+    protocol_transport_lookup: MemoryLookup,
+    protocol_transport_prepare_tx: Option<mpsc::Sender<WorkerProtocolTransportPrepareRequest>>,
     dial_ids: DialIdGenerator,
-    accept_queue_capacity: usize,
     session_config: WebRtcSessionConfig,
     low_latency_quic_acks: bool,
     sessions: HashMap<WorkerSessionKey, WorkerSessionState>,
     connections: HashMap<WorkerConnectionKey, WorkerConnectionState>,
     streams: HashMap<WorkerStreamKey, Arc<WorkerStreamState>>,
     accepts: HashMap<String, AcceptRegistrationState>,
-    next_accept_id: u64,
     next_connection_key: u64,
     next_stream_key: u64,
     closed: bool,
@@ -39,6 +48,7 @@ mod benchmark;
 mod connection;
 mod connection_state;
 mod core;
+mod protocol_transport;
 mod rtc;
 mod session;
 mod session_state;
@@ -77,29 +87,6 @@ impl BrowserWorkerNode {
 }
 
 impl BrowserWorkerNodeInner {
-    fn relay_endpoint_alpns(&self) -> Vec<Vec<u8>> {
-        let mut alpns = Vec::with_capacity(self.accepts.len() + 1);
-        alpns.push(WEBRTC_BOOTSTRAP_ALPN.to_vec());
-        alpns.extend(self.accepts.keys().map(|alpn| alpn.as_bytes().to_vec()));
-        alpns
-    }
-
-    fn webrtc_endpoint_alpns(&self) -> Vec<Vec<u8>> {
-        self.accepts
-            .keys()
-            .map(|alpn| alpn.as_bytes().to_vec())
-            .collect()
-    }
-
-    fn refresh_endpoint_alpns(&self) {
-        if let Some(endpoint) = &self.relay_endpoint {
-            endpoint.set_alpns(self.relay_endpoint_alpns());
-        }
-        if let Some(endpoint) = &self.webrtc_endpoint {
-            endpoint.set_alpns(self.webrtc_endpoint_alpns());
-        }
-    }
-
     fn refresh_webrtc_transport_addrs(&self) {
         let mut addrs = vec![WebRtcAddr::capability(self.endpoint_id).to_custom_addr()];
         addrs.extend(self.sessions.values().filter_map(|session| {

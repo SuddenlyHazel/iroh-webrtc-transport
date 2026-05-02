@@ -105,6 +105,23 @@ pub use facade::{WebRtcDialOptions, WebRtcNodeConfig};
 macro_rules! browser_app {
     (
         app = $app_entry:ident => $app_impl:path;
+        worker = $worker_entry:ident => {
+            protocols = [$($protocol:expr),* $(,)?] $(,)?
+        } $(;)?
+    ) => {
+        #[::wasm_bindgen::prelude::wasm_bindgen]
+        pub async fn $app_entry() -> ::std::result::Result<(), ::wasm_bindgen::JsValue> {
+            $app_impl().await
+        }
+
+        $crate::browser_app! {
+            worker = $worker_entry => {
+                protocols = [$($protocol),*]
+            };
+        }
+    };
+    (
+        app = $app_entry:ident => $app_impl:path;
         worker = $worker_entry:ident $(;)?
     ) => {
         #[::wasm_bindgen::prelude::wasm_bindgen]
@@ -114,6 +131,27 @@ macro_rules! browser_app {
 
         $crate::browser_app! {
             worker = $worker_entry;
+        }
+    };
+    (
+        worker = $worker_entry:ident => {
+            protocols = [$($protocol:expr),* $(,)?] $(,)?
+        } $(;)?
+    ) => {
+        #[::wasm_bindgen::prelude::wasm_bindgen]
+        pub fn $worker_entry() -> ::std::result::Result<(), ::wasm_bindgen::JsValue> {
+            let mut registry = $crate::browser::BrowserWorkerProtocolRegistry::new();
+            $(
+                registry
+                    .register($protocol)
+                    .map_err(|err| ::wasm_bindgen::JsValue::from_str(&err))?;
+            )*
+            $crate::browser::start_browser_worker_with_protocols(registry)
+        }
+
+        #[::wasm_bindgen::prelude::wasm_bindgen(js_name = __iroh_webrtc_wasm_module)]
+        pub fn __iroh_webrtc_wasm_module() -> ::wasm_bindgen::JsValue {
+            ::wasm_bindgen::module()
         }
     };
     (worker = $worker_entry:ident $(;)?) => {

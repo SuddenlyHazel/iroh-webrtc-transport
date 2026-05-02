@@ -2,6 +2,7 @@
 use iroh::EndpointId;
 #[cfg(test)]
 use iroh_base::CustomAddr;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::{
     browser_worker::{
@@ -9,7 +10,7 @@ use crate::{
         DEFAULT_WORKER_ACCEPT_QUEUE_CAPACITY,
     },
     config::WebRtcSessionConfig,
-    core::signaling::WebRtcSignal,
+    core::signaling::{BootstrapTransportIntent, WebRtcSignal},
     transport::WebRtcTransportConfig,
 };
 
@@ -19,6 +20,11 @@ pub(in crate::browser_worker) struct BrowserWorkerNodeConfig {
     pub(in crate::browser_worker) session_config: WebRtcSessionConfig,
     pub(in crate::browser_worker) transport_config: WebRtcTransportConfig,
     pub(in crate::browser_worker) low_latency_quic_acks: bool,
+    pub(in crate::browser_worker) facade_alpns: Vec<String>,
+    pub(in crate::browser_worker) benchmark_echo_alpns: Vec<String>,
+    pub(in crate::browser_worker) worker_protocol_transport_intent: BootstrapTransportIntent,
+    pub(in crate::browser_worker) protocol_transport_prepare_tx:
+        Option<mpsc::Sender<WorkerProtocolTransportPrepareRequest>>,
 }
 
 impl BrowserWorkerNodeConfig {
@@ -49,8 +55,20 @@ impl Default for BrowserWorkerNodeConfig {
             session_config: WebRtcSessionConfig::default(),
             transport_config: WebRtcTransportConfig::default(),
             low_latency_quic_acks: false,
+            facade_alpns: Vec::new(),
+            benchmark_echo_alpns: Vec::new(),
+            worker_protocol_transport_intent: BootstrapTransportIntent::WebRtcPreferred,
+            protocol_transport_prepare_tx: None,
         }
     }
+}
+
+#[derive(Debug)]
+pub(in crate::browser_worker) struct WorkerProtocolTransportPrepareRequest {
+    pub(in crate::browser_worker) remote: iroh::EndpointId,
+    pub(in crate::browser_worker) alpn: String,
+    pub(in crate::browser_worker) transport_intent: BootstrapTransportIntent,
+    pub(in crate::browser_worker) response: oneshot::Sender<BrowserWorkerResult<()>>,
 }
 
 #[cfg(test)]

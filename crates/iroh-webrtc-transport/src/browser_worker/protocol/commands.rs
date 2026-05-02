@@ -36,6 +36,13 @@ pub(in crate::browser_worker) enum WorkerCommand {
     NodeClose {
         reason: Option<String>,
     },
+    ProtocolCommand {
+        alpn: String,
+        command: Value,
+    },
+    ProtocolNextEvent {
+        alpn: String,
+    },
     StreamOpenBi {
         connection_key: WorkerConnectionKey,
     },
@@ -149,6 +156,19 @@ impl WorkerCommand {
             WORKER_NODE_CLOSE_COMMAND => Ok(Self::NodeClose {
                 reason: decode_payload::<ReasonPayload>(command, payload)?.reason,
             }),
+            WORKER_PROTOCOL_COMMAND_COMMAND => {
+                let payload: ProtocolCommandPayload = decode_payload(command, payload)?;
+                Ok(Self::ProtocolCommand {
+                    alpn: validate_alpn(payload.alpn)?,
+                    command: payload.command,
+                })
+            }
+            WORKER_PROTOCOL_NEXT_EVENT_COMMAND => {
+                let payload: AlpnPayload = decode_payload(command, payload)?;
+                Ok(Self::ProtocolNextEvent {
+                    alpn: validate_alpn(payload.alpn)?,
+                })
+            }
             STREAM_OPEN_BI_COMMAND => Ok(Self::StreamOpenBi {
                 connection_key: decode_payload::<ConnectionKeyPayload>(command, payload)?
                     .connection_key()?,
@@ -249,6 +269,12 @@ struct SpawnPayload {
     accept_queue_capacity: Option<usize>,
     #[serde(default)]
     low_latency_quic_acks: bool,
+    #[serde(default = "default_worker_protocol_transport_intent")]
+    worker_protocol_transport_intent: BootstrapTransportIntent,
+    #[serde(default)]
+    facade_alpns: Vec<String>,
+    #[serde(default)]
+    benchmark_echo_alpns: Vec<String>,
 }
 
 impl SpawnPayload {
@@ -263,10 +289,25 @@ impl SpawnPayload {
         if let Some(capacity) = self.accept_queue_capacity {
             config.accept_queue_capacity = capacity;
         }
+        config.facade_alpns = self
+            .facade_alpns
+            .into_iter()
+            .map(validate_alpn)
+            .collect::<BrowserWorkerResult<Vec<_>>>()?;
+        config.benchmark_echo_alpns = self
+            .benchmark_echo_alpns
+            .into_iter()
+            .map(validate_alpn)
+            .collect::<BrowserWorkerResult<Vec<_>>>()?;
         config.low_latency_quic_acks = self.low_latency_quic_acks;
+        config.worker_protocol_transport_intent = self.worker_protocol_transport_intent;
         config.validate()?;
         Ok(config)
     }
+}
+
+fn default_worker_protocol_transport_intent() -> BootstrapTransportIntent {
+    BootstrapTransportIntent::WebRtcPreferred
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -347,6 +388,13 @@ impl ConnectionReasonPayload {
 struct ReasonPayload {
     #[serde(default)]
     reason: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProtocolCommandPayload {
+    alpn: String,
+    command: Value,
 }
 
 #[derive(Debug, serde::Deserialize)]

@@ -15,7 +15,8 @@ pub(in crate::browser_worker) use keys::{
 #[cfg(test)]
 pub(in crate::browser_worker) use node::BrowserWorkerNodeState;
 pub(in crate::browser_worker) use node::{
-    BrowserWorkerNodeConfig, WorkerCloseResult, WorkerSpawnResult,
+    BrowserWorkerNodeConfig, WorkerCloseResult, WorkerProtocolTransportPrepareRequest,
+    WorkerSpawnResult,
 };
 pub(in crate::browser_worker) use rtc::{
     WorkerAttachDataChannelResult, WorkerBootstrapSignalInput, WorkerBootstrapSignalResult,

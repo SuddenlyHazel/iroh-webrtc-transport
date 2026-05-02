@@ -35,9 +35,12 @@ async fn run_app() -> Result<(), JsValue> {
     let action_buttons = vec![ping.clone(), latency.clone(), throughput.clone()];
 
     let low_latency_quic_acks = query_flag("lowLatencyQuicAcks")?;
-    let node = BrowserWebRtcNode::spawn(
+    let node = BrowserWebRtcNode::builder(
         BrowserWebRtcNodeConfig::default().with_low_latency_quic_acks(low_latency_quic_acks),
     )
+    .accept_facade(ALPN)
+    .accept_worker_latency_echo(WORKER_BENCHMARK_ALPN)
+    .spawn()
     .await?;
     let endpoint_id = node.endpoint_id().to_string();
     local.set_value(&endpoint_id);
